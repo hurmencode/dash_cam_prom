@@ -1,0 +1,20 @@
+# Основные зависимости для Dash Cam Prom
+
+# Обработка видео и изображений
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# GUI
+tkinter  # входит в стандартную библиотеку Python
+
+# Для работы с GigE камерами (Aravis)
+# Устанавливается отдельно через MSYS2:
+# pacman -S mingw-w64-x86_64-aravis mingw-w64-x86_64-python-gobject
+
+# Альтернативно, можно использовать Arena SDK
+# Скачать с: https://www.thinklucid.com/downloads/
+
+# Дополнительные утилиты
+# PyGObject (для Aravis) - устанавливается через MSYS2
+# gi  # требуется для Aravis
