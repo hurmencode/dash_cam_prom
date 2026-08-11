@@ -8,6 +8,8 @@ import platform
 import re
 import time
 from datetime import datetime
+import threading
+import queue
 
 # ============ БАЗОВЫЙ ИНТЕРФЕЙС ============
 class CameraInterface(ABC):
@@ -29,13 +31,14 @@ class VideoRecorder:
                  mode: str = 'lossy'):
         """
         Args:
-            mode: 'lossy' - XVID (сжатый)
-                  'lossless' - FFV1 (без потерь)
-                  'uncompressed' - MJPG (минимальное сжатие)
-                  'png_frames' - каждый кадр как PNG
+            mode: 
+                'lossy' - XVID (сжатый с потерями, маленький размер)
+                'lossless' - HFYU (без потерь, идеальное качество)
+                'high_quality' - MJPG (минимальные потери, большой размер)
+                'png_frames' - XVID + PNG кадры (для нейросетей)
         """
         self.output_dir = output_dir
-        self.fps = fps
+        self.fps = min(fps, 30)
         self.mode = mode
         self.writer = None
         self.is_recording = False
@@ -46,31 +49,35 @@ class VideoRecorder:
         self.frame_count = 0
         self.saved_frames = []
         self.save_frames_as_png = (mode == 'png_frames')
+        self._last_frame_time = 0
+        self._frame_interval = 1.0 / self.fps
         
-        # Выбираем кодек в зависимости от режима
+        # ============ РАБОЧИЕ КОДЕКИ ============
         codecs = {
-            'lossy': 'XVID',
-            'lossless': 'FFV1',
-            'uncompressed': 'MJPG',  # MJPG - почти без потерь, работает везде
-            'png_frames': 'XVID'
+            'lossy': 'XVID',        # Сжатый с потерями
+            'lossless': 'HFYU',     # Без потерь
+            'high_quality': 'MJPG', # Высокое качество (минимальные потери)
+            'png_frames': 'XVID'    # Видео + PNG
         }
         self.fourcc = codecs.get(mode, 'XVID')
         
-        # Расширение файла
-        self.extensions = {
+        extensions = {
             'lossy': '.avi',
-            'lossless': '.mkv',
-            'uncompressed': '.avi',
+            'lossless': '.avi',
+            'high_quality': '.avi',
             'png_frames': '.avi'
         }
-        self.extension = self.extensions.get(mode, '.avi')
+        self.extension = extensions.get(mode, '.avi')
         
         os.makedirs(output_dir, exist_ok=True)
         
-        # Если режим PNG - создаем папку для кадров
         if self.save_frames_as_png:
             self.png_dir = os.path.join(output_dir, 'frames')
             os.makedirs(self.png_dir, exist_ok=True)
+            self.png_queue = queue.Queue(maxsize=200)
+            self.png_writer_thread = None
+            self.png_writer_running = False
+            self._start_png_writer()
     
     def start_recording(self, width: int, height: int, camera_name: str = "camera") -> str:
         if self.is_recording:
@@ -80,14 +87,15 @@ class VideoRecorder:
         self.frame_height = height
         self.frame_count = 0
         self.saved_frames = []
+        self._last_frame_time = 0
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = re.sub(r'[^\w\-_\. ]', '_', camera_name)
         
         mode_labels = {
             'lossy': 'compressed',
-            'lossless': 'lossless',
-            'uncompressed': 'uncompressed',
+            'lossless': 'lossless_hfyu',
+            'high_quality': 'high_quality_mjpg',
             'png_frames': 'png_frames'
         }
         mode_label = mode_labels.get(self.mode, 'video')
@@ -103,19 +111,18 @@ class VideoRecorder:
             (width, height)
         )
         
-        # Если не получилось - пробуем альтернативные кодеки
+        # Fallback если кодек не поддерживается
         if not self.writer.isOpened():
-            print(f"⚠️ Кодек {self.fourcc} не поддерживается, пробуем альтернативы...")
+            print(f" Кодек {self.fourcc} не поддерживается, пробуем альтернативы...\n")
             
-            # Список альтернативных кодеков для каждого режима
             fallback_codecs = {
-                'lossy': ['MJPG', 'X264', 'XVID'],
-                'lossless': ['HFYU', 'FFV1', 'MJPG'],
-                'uncompressed': ['MJPG', 'XVID', 'X264'],
-                'png_frames': ['MJPG', 'XVID', 'X264']
+                'lossy': ['XVID', 'X264'],
+                'lossless': ['HFYU', 'FFV1'],
+                'high_quality': ['MJPG', 'XVID', 'X264'],
+                'png_frames': ['MJPG']
             }
             
-            for codec in fallback_codecs.get(self.mode, ['MJPG', 'XVID']):
+            for codec in fallback_codecs.get(self.mode, ['XVID', 'MJPG']):
                 fourcc_code = cv2.VideoWriter_fourcc(*codec)
                 self.writer = cv2.VideoWriter(
                     self.record_path,
@@ -125,26 +132,27 @@ class VideoRecorder:
                 )
                 if self.writer.isOpened():
                     self.fourcc = codec
-                    print(f"   ✅ Используем кодек: {codec}")
+                    print(f"    Используем кодек: {codec}\n")
                     break
         
         if not self.writer.isOpened():
-            raise RuntimeError(f"Failed to create video writer: {self.record_path}")
+            raise RuntimeError(f"Failed to create video writer: {self.record_path}\n")
         
         self.is_recording = True
         self.recording_start_time = time.time()
         
         mode_names = {
-            'lossy': 'Сжатый',
-            'lossless': 'Без потерь',
-            'uncompressed': 'Минимальное сжатие',
+            'lossy': 'Сжатый (XVID)',
+            'lossless': 'Без потерь (HFYU)',
+            'high_quality': 'Минимальное сжатие (MJPG)',
             'png_frames': 'Кадры PNG'
         }
-        print(f"🔴 Запись начата: {self.record_path}")
-        print(f"   Режим: {mode_names.get(self.mode, self.mode)}, Кодек: {self.fourcc}")
+        print(f" Запись начата: {self.record_path}\n")
+        print(f"   Режим: {mode_names.get(self.mode, self.mode)}\n")
+        print(f"   Кодек: {self.fourcc}, FPS: {self.fps}\n")
         
         if self.save_frames_as_png:
-            print(f"   📁 PNG кадры будут сохранены в: {self.png_dir}")
+            print(f"    PNG кадры будут сохранены в: {self.png_dir}\n")
         
         return self.record_path
     
@@ -152,18 +160,54 @@ class VideoRecorder:
         if not self.is_recording or self.writer is None:
             return False
         
+        current_time = time.time()
+        if current_time - self._last_frame_time < self._frame_interval:
+            return True
+        
         try:
+            # ============ ПРОВЕРКА ФОРМАТА КАДРА ============
+            # Проверяем что кадр существует
+            if frame is None:
+                return False
+            
+            # Проверяем тип данных
+            if frame.dtype != np.uint8:
+                try:
+                    frame = frame.astype(np.uint8)
+                except:
+                    return False
+            
+            # Проверяем размерность
+            if len(frame.shape) == 2:
+                # Если серый, конвертируем в BGR
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif len(frame.shape) == 3:
+                if frame.shape[2] == 4:
+                    # RGBA -> BGR
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                elif frame.shape[2] == 3:
+                    # Уже BGR или RGB
+                    pass
+                else:
+                    return False
+            else:
+                return False
+            # ================================================
+            
+            # Изменяем размер если нужно
             if frame.shape[1] != self.frame_width or frame.shape[0] != self.frame_height:
                 frame = cv2.resize(frame, (self.frame_width, self.frame_height))
             
             self.writer.write(frame)
             self.frame_count += 1
+            self._last_frame_time = current_time
             
             if self.save_frames_as_png:
-                png_filename = f"frame_{self.frame_count:06d}.png"
-                png_path = os.path.join(self.png_dir, png_filename)
-                cv2.imwrite(png_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 0])
-                self.saved_frames.append(png_path)
+                try:
+                    frame_copy = frame.copy()
+                    self.png_queue.put_nowait((frame_copy, self.frame_count))
+                except queue.Full:
+                    pass
             
             return True
         except Exception as e:
@@ -176,6 +220,11 @@ class VideoRecorder:
         
         self.is_recording = False
         
+        if self.save_frames_as_png and self.png_writer_thread:
+            self.png_writer_running = False
+            self.png_queue.put(None)
+            self.png_writer_thread.join(timeout=5)
+        
         if self.writer:
             self.writer.release()
             self.writer = None
@@ -183,17 +232,44 @@ class VideoRecorder:
             duration = time.time() - self.recording_start_time
             file_size = os.path.getsize(self.record_path) / (1024*1024)
             
-            print(f"⏹️ Запись остановлена: {self.record_path}")
-            print(f"   Кадров: {self.frame_count}, Длительность: {duration:.1f} сек")
-            print(f"   Размер видео: {file_size:.1f} MB")
+            print(f" Запись остановлена: {self.record_path}\n")
+            print(f"   Кадров: {self.frame_count}\n")
+            print(f"   Длительность: {duration:.1f} сек\n")
+            print(f"   Размер видео: {file_size:.1f} MB\n")
             
             if self.save_frames_as_png:
-                png_size = sum(os.path.getsize(f) for f in self.saved_frames) / (1024*1024)
-                print(f"   PNG кадров: {len(self.saved_frames)}, Размер: {png_size:.1f} MB")
+                print(f"   PNG кадров: {len(self.saved_frames)}\n")
             
             return self.record_path
         
         return None
+    
+    def extract_frames_to_png(self, video_path: str, output_dir: str = None) -> List[str]:
+        if output_dir is None:
+            output_dir = os.path.join(os.path.dirname(video_path), 'frames_extracted')
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        cap = cv2.VideoCapture(video_path)
+        frame_count = 0
+        saved_paths = []
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            png_path = os.path.join(output_dir, f"frame_{frame_count:06d}.png")
+            cv2.imwrite(png_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+            saved_paths.append(png_path)
+            frame_count += 1
+            
+            if frame_count % 100 == 0:
+                print(f"   Извлечено кадров: {frame_count}\n")
+        
+        cap.release()
+        print(f" Извлечено {frame_count} кадров в {output_dir}\n")
+        return saved_paths
     
     def get_recording_status(self) -> Dict:
         return {
@@ -206,6 +282,29 @@ class VideoRecorder:
             'fourcc': self.fourcc,
             'save_frames_as_png': self.save_frames_as_png
         }
+    
+    def _start_png_writer(self):
+        self.png_writer_running = True
+        self.png_writer_thread = threading.Thread(target=self._png_writer_loop, daemon=True)
+        self.png_writer_thread.start()
+    
+    def _png_writer_loop(self):
+        while self.png_writer_running:
+            try:
+                item = self.png_queue.get(timeout=0.1)
+                if item is None:
+                    break
+                
+                frame, frame_number = item
+                png_path = os.path.join(self.png_dir, f"frame_{frame_number:06d}.png")
+                cv2.imwrite(png_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+                self.saved_frames.append(png_path)
+                self.png_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Ошибка записи PNG: {e}\n")
 
 # ============ WEBCAM MANAGER ============
 class WebcamManager(CameraInterface):
@@ -224,7 +323,7 @@ class WebcamManager(CameraInterface):
             'status': 'Connected' if self.cap and self.cap.isOpened() else 'Failed'
         }
         if not self.cap or not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open webcam {device_id}")
+            raise RuntimeError(f"Cannot open webcam {device_id}\n")
     
     def get_frame(self) -> Optional[np.ndarray]:
         if self.cap:
@@ -258,13 +357,10 @@ class LucidCameraManager(CameraInterface):
         self._connect_camera()
     
     def _get_camera_ip(self) -> str:
-        """Получает IP-адрес камеры"""
         try:
-            # Если IP уже сохранен - возвращаем его
             if self.saved_ip and self.saved_ip != 'Unknown':
                 return self.saved_ip
             
-            # Пробуем получить IP из устройства
             ip_methods = ['DeviceIPAddress', 'GevCurrentIPAddress', 'GevPersistentIPAddress']
             
             for node_name in ip_methods:
@@ -272,18 +368,14 @@ class LucidCameraManager(CameraInterface):
                     node = self.camera.nodemap.get_node(node_name)
                     if node:
                         value = node.value
-                        
-                        # Если это число - конвертируем в IP
                         if isinstance(value, int):
                             ip_bytes = value.to_bytes(4, byteorder='big')
                             return '.'.join(str(b) for b in ip_bytes)
-                        # Если это строка
                         elif isinstance(value, str):
                             return value
                 except:
                     continue
             
-            # Пробуем получить через интерфейс
             try:
                 if hasattr(self.camera, 'tl_device'):
                     interface = str(self.camera.tl_device.interface)
@@ -295,7 +387,7 @@ class LucidCameraManager(CameraInterface):
             
             return 'Unknown'
         except Exception as e:
-            print(f"Error getting camera IP: {e}")
+            print(f"Error getting camera IP: {e}\n")
             return 'Unknown'
     
     def _connect_camera(self):
@@ -303,7 +395,7 @@ class LucidCameraManager(CameraInterface):
             devices = self.system.create_device()
             
             if not devices:
-                raise RuntimeError("No Lucid Triton cameras found")
+                raise RuntimeError("No Lucid Triton cameras found\n")
             
             if self.device_index < len(devices):
                 self.camera = devices[self.device_index]
@@ -313,8 +405,6 @@ class LucidCameraManager(CameraInterface):
             try:
                 model_name = self.camera.nodemap.get_node('DeviceModelName').value
                 serial = self.camera.nodemap.get_node('DeviceSerialNumber').value
-                
-                # Получаем IP (используем сохраненный если есть)
                 ip_address = self._get_camera_ip()
                 
                 self._info = {
@@ -323,10 +413,10 @@ class LucidCameraManager(CameraInterface):
                     'ip': ip_address,
                     'status': 'Connected'
                 }
-                print(f"Connected: {model_name} (SN: {serial}, IP: {ip_address})")
+                print(f"Connected: {model_name} (SN: {serial}, IP: {ip_address})\n")
                 
             except Exception as e:
-                print(f"Error reading camera info: {e}")
+                print(f"Error reading camera info: {e}\n")
                 self._info['status'] = 'Connected (Info Error)'
             
             if self.pixel_format:
@@ -338,7 +428,7 @@ class LucidCameraManager(CameraInterface):
             self.camera.start_stream()
             
         except Exception as e:
-            print(f"Error connecting to Lucid camera: {e}")
+            print(f"Error connecting to Lucid camera: {e}\n")
             self._info['status'] = f'Error: {str(e)[:50]}'
             raise
     
@@ -355,7 +445,7 @@ class LucidCameraManager(CameraInterface):
             img_array = np.ctypeslib.as_array(buffer.pdata, shape=(height, width))
             frame = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
         except Exception as e:
-            print(f"Frame conversion error: {e}")
+            print(f"Frame conversion error: {e}\n")
             frame = None
         finally:
             self.camera.requeue_buffer(buffer)
@@ -375,13 +465,9 @@ class LucidCameraManager(CameraInterface):
 
 # ============ СКАНЕР КАМЕР ============
 class CameraScanner:
-    """Сканер для поиска всех доступных камер"""
-    
     @staticmethod
     def _extract_ip_from_device(device) -> str:
-        """Извлекает IP-адрес из устройства Lucid"""
         try:
-            # Метод 1: DeviceIPAddress
             try:
                 node = device.nodemap.get_node('DeviceIPAddress')
                 if node:
@@ -394,7 +480,6 @@ class CameraScanner:
             except:
                 pass
             
-            # Метод 2: GevCurrentIPAddress
             try:
                 node = device.nodemap.get_node('GevCurrentIPAddress')
                 if node:
@@ -407,7 +492,6 @@ class CameraScanner:
             except:
                 pass
             
-            # Метод 3: Через интерфейс
             try:
                 if hasattr(device, 'tl_device'):
                     interface = str(device.tl_device.interface)
@@ -423,9 +507,7 @@ class CameraScanner:
     
     @staticmethod
     def scan_webcams(max_devices: int = 10) -> List[Dict]:
-        """Сканирует USB веб-камеры"""
         cameras = []
-        
         for device_id in range(max_devices):
             try:
                 if os.name == 'nt':
@@ -447,33 +529,26 @@ class CameraScanner:
                     cap.release()
             except Exception:
                 continue
-        
         return cameras
     
     @staticmethod
     def scan_lucid_cameras() -> List[Dict]:
-        """Сканирует Lucid Triton камеры и сохраняет IP-адреса"""
         cameras = []
-        
         try:
             from arena_api.system import system
-            
             devices = system.create_device()
             
             if not devices:
-                print("No Lucid devices found")
+                print("No Lucid devices found\n")
                 return cameras
             
             for idx, device in enumerate(devices):
                 try:
-                    # Получаем информацию о камере
                     model_name = device.nodemap.get_node('DeviceModelName').value
                     serial = device.nodemap.get_node('DeviceSerialNumber').value
-                    
-                    # Извлекаем IP-адрес
                     ip_address = CameraScanner._extract_ip_from_device(device)
                     
-                    print(f"Found Lucid camera: {model_name} (SN: {serial}, IP: {ip_address})")
+                    print(f"Found Lucid camera: {model_name} (SN: {serial}, IP: {ip_address})\n")
                     
                     cameras.append({
                         'name': model_name,
@@ -487,7 +562,7 @@ class CameraScanner:
                     })
                     
                 except Exception as e:
-                    print(f"Error reading Lucid camera info: {e}")
+                    print(f"Error reading Lucid camera info: {e}\n")
                     cameras.append({
                         'name': f'Lucid Camera {idx}',
                         'serial': 'Unknown',
@@ -499,39 +574,36 @@ class CameraScanner:
                         '_saved_ip': 'Unknown'
                     })
             
-            # Освобождаем устройства
             system.destroy_device()
             
         except ImportError:
-            print("Arena SDK not installed")
+            print("Arena SDK not installed\n")
         except Exception as e:
-            print(f"Error scanning Lucid cameras: {e}")
+            print(f"Error scanning Lucid cameras: {e}\n")
         
         return cameras
     
     @staticmethod
     def scan_all() -> List[Dict]:
-        """Сканирует все типы камер"""
         all_cameras = []
         
-        print("Scanning webcams...")
+        print("Scanning webcams...\n")
         webcams = CameraScanner.scan_webcams()
         all_cameras.extend(webcams)
-        print(f"Found {len(webcams)} webcams")
+        print(f"Found {len(webcams)} webcams\n")
         
-        print("Scanning Lucid cameras...")
+        print("Scanning Lucid cameras...\n")
         lucid_cams = CameraScanner.scan_lucid_cameras()
         all_cameras.extend(lucid_cams)
-        print(f"Found {len(lucid_cams)} Lucid cameras")
+        print(f"Found {len(lucid_cams)} Lucid cameras\n")
         
         return all_cameras
 
-# ============ ФАБРИКА СОЗДАНИЯ КАМЕР ============
+# ============ ФАБРИКА ============
 def create_camera(camera_type: str = "webcam", **kwargs) -> CameraInterface:
     if camera_type == "webcam":
         return WebcamManager(device_id=kwargs.get("device_id", 0))
     elif camera_type == "lucid":
-        # Передаем сохраненный IP в конструктор
         saved_ip = kwargs.get("saved_ip", None)
         return LucidCameraManager(
             pixel_format=kwargs.get("pixel_format", "Mono8"),

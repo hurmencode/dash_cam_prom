@@ -179,11 +179,11 @@ class CameraDiscoveryApp:
         self.tree.heading('ip', text='IP-адрес')
         self.tree.heading('status', text='Статус')
         
-        self.tree.column('name', width=200, anchor='w')
-        self.tree.column('type', width=100, anchor='center')
-        self.tree.column('serial', width=180, anchor='w')
-        self.tree.column('ip', width=150, anchor='center')
-        self.tree.column('status', width=120, anchor='center')
+        self.tree.column('name', anchor='center')
+        self.tree.column('type', anchor='center')
+        self.tree.column('serial', anchor='center')
+        self.tree.column('ip', anchor='center')
+        self.tree.column('status', anchor='center')
         
         scrollbar = ttk.Scrollbar(self.camera_tab, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
@@ -194,13 +194,13 @@ class CameraDiscoveryApp:
         self.tree.bind('<<TreeviewSelect>>', self.on_select_camera)
         self.create_context_menu()
         
-        self.status_bar = ttk.Label(
-            self.camera_tab, 
-            text="Готов к работе. Нажмите 'Поиск камер'",
-            relief=tk.SUNKEN,
-            anchor=tk.W
-        )
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
+        # self.status_bar = ttk.Label(
+        #     self.camera_tab, 
+        #     text="Готов к работе. Нажмите 'Поиск камер'",
+        #     relief=tk.SUNKEN,
+        #     #anchor=tk.NW
+        # )
+        # self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
     
     def create_video_tab(self):
         # Верхняя панель управления
@@ -245,23 +245,15 @@ class CameraDiscoveryApp:
             textvariable=self.record_mode_var,
             values=[
                 'Сжатый (XVID)', 
-                'Без потерь (FFV1)', 
-                'Без сжатия (RAW)',
+                'Без потерь (HFYU)', 
+                'Высокое качество (сжатый) (MJPG)',
                 'Кадры PNG (без потерь)'
             ],
             state='readonly',
-            width=20
+            width=50
         )
         mode_combo.pack(side=tk.LEFT, padx=5)
         
-        # Подсказка по режимам
-        mode_tip = ttk.Label(
-            mode_frame,
-            text="Для нейросетей выбирайте 'Без потерь' или 'PNG'",
-            font=('Arial', 8),
-            foreground="#6B3F3F"
-        )
-        mode_tip.pack(side=tk.LEFT, padx=5)
         # ===================================================
         
         # Кнопка запуска/остановки видео
@@ -422,7 +414,7 @@ class CameraDiscoveryApp:
                 if ip and ip != 'N/A' and ip != 'Unknown':
                     self.root.clipboard_clear()
                     self.root.clipboard_append(ip)
-                    self.status_bar.config(text=f"Скопирован IP: {ip}")
+                    #self.status_bar.config(text=f"Скопирован IP: {ip}")
                     self.log_success(f"IP адрес скопирован: {ip}")
     
     def copy_serial(self):
@@ -434,7 +426,7 @@ class CameraDiscoveryApp:
                 if serial and serial != 'N/A' and serial != 'Unknown':
                     self.root.clipboard_clear()
                     self.root.clipboard_append(serial)
-                    self.status_bar.config(text=f"Скопирован серийный номер: {serial}")
+                    #self.status_bar.config(text=f"Скопирован серийный номер: {serial}")
                     self.log_success(f"Серийный номер скопирован: {serial}")
     
     def get_type_display(self, camera_type: str) -> str:
@@ -449,7 +441,7 @@ class CameraDiscoveryApp:
         self.log_info("Запуск сканирования камер...")
         self.scan_btn.config(state=tk.DISABLED)
         self.loading_label.config(text="Поиск камер...")
-        self.status_bar.config(text="Выполняется сканирование камер...")
+        #self.status_bar.config(text="Выполняется сканирование камер...")
         
         thread = Thread(target=self._scan_cameras_thread, daemon=True)
         thread.start()
@@ -470,7 +462,7 @@ class CameraDiscoveryApp:
         
         if not self.cameras:
             self.tree.insert('', 'end', values=('Нет камер', '—', '—', '—', '—'))
-            self.status_bar.config(text="Камеры не найдены")
+            #self.status_bar.config(text="Камеры не найдены")
             self.log_warning("Камеры не найдены")
         else:
             for cam in self.cameras:
@@ -515,7 +507,7 @@ class CameraDiscoveryApp:
             if webcam_count > 0 or lucid_count > 0:
                 status_text += ")"
             
-            self.status_bar.config(text=status_text)
+            #self.status_bar.config(text=status_text)
             self.log_info(f"Отображено камер в таблице: {len(self.cameras)}")
         
         self.scan_btn.config(state=tk.NORMAL)
@@ -537,9 +529,9 @@ class CameraDiscoveryApp:
                 serial = self.selected_camera.get('serial', 'N/A')
                 type_display = self.get_type_display(camera_type)
                 
-                self.status_bar.config(
-                    text=f"Выбрана: {name} | Тип: {type_display} | SN: {serial} | IP: {ip}"
-                )
+                # self.status_bar.config(
+                #     text=f"Выбрана: {name} | Тип: {type_display} | SN: {serial} | IP: {ip}"
+                # )
                 self.log_info(f"Выбрана камера: {name} (Тип: {type_display}, SN: {serial})")
             else:
                 self.connect_btn.config(state=tk.DISABLED)
@@ -561,7 +553,7 @@ class CameraDiscoveryApp:
         
         try:
             self.log_info(f"Попытка подключения к {camera_name}...")
-            self.status_bar.config(text=f"Подключение к {camera_name}...")
+            #self.status_bar.config(text=f"Подключение к {camera_name}...")
             self.connect_btn.config(state=tk.DISABLED)
             
             if camera_type == 'webcam':
@@ -592,7 +584,7 @@ class CameraDiscoveryApp:
             
             self.log_success(f"Успешно подключено к {camera_name} (IP: {ip})")
             messagebox.showinfo("Успешно", info_msg)
-            self.status_bar.config(text=f"Подключено: {camera_name} (Тип: {type_display})")
+            #self.status_bar.config(text=f"Подключено: {camera_name} (Тип: {type_display})")
             
             self.show_video_btn.config(state=tk.NORMAL)
             self.video_control_btn.config(state=tk.NORMAL)
@@ -605,7 +597,7 @@ class CameraDiscoveryApp:
             error_msg = f"Не удалось подключиться: {e}"
             self.log_error(error_msg)
             messagebox.showerror("Ошибка", error_msg)
-            self.status_bar.config(text="Ошибка подключения")
+            #self.status_bar.config(text="Ошибка подключения")
             self.current_camera = None
         finally:
             self.connect_btn.config(state=tk.NORMAL)
@@ -624,7 +616,7 @@ class CameraDiscoveryApp:
     
     def refresh_status(self):
         self.log_info("Обновление статуса камер...")
-        self.status_bar.config(text="Обновление статуса...")
+        #self.status_bar.config(text="Обновление статуса...")
         self.scan_cameras()
     
     def show_video(self):
@@ -822,8 +814,8 @@ class CameraDiscoveryApp:
             # ============ ВЫБОР РЕЖИМА ЗАПИСИ ============
             mode_map = {
                 'Сжатый (XVID)': 'lossy',
-                'Без потерь (FFV1)': 'lossless',
-                'Без сжатия (RAW)': 'uncompressed',
+                'Без потерь (HFYU)': 'lossless',
+                'Высокое качество (сжатый) (MJPG)': 'high_quality',
                 'Кадры PNG (без потерь)': 'png_frames'
             }
             
@@ -931,7 +923,7 @@ class CameraDiscoveryApp:
     def _show_error(self, error_message):
         self.scan_btn.config(state=tk.NORMAL)
         self.loading_label.config(text="")
-        self.status_bar.config(text=f"Ошибка: {error_message}")
+        #self.status_bar.config(text=f"Ошибка: {error_message}")
         messagebox.showerror("Ошибка", error_message)
 
 def main():
