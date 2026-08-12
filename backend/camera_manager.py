@@ -35,10 +35,10 @@ class VideoRecorder:
                 'lossy' - XVID (сжатый с потерями, маленький размер)
                 'lossless' - HFYU (без потерь, идеальное качество)
                 'high_quality' - MJPG (минимальные потери, большой размер)
-                'png_frames' - XVID + PNG кадры (для нейросетей)
+                'png_frames' - MJPG + PNG кадры (для нейросетей)
         """
         self.output_dir = output_dir
-        self.fps = min(fps, 30)
+        self.fps = fps
         self.mode = mode
         self.writer = None
         self.is_recording = False
@@ -50,14 +50,14 @@ class VideoRecorder:
         self.saved_frames = []
         self.save_frames_as_png = (mode == 'png_frames')
         self._last_frame_time = 0
-        self._frame_interval = 1.0 / self.fps
+        #self._frame_interval = 1.0 / self.fps
         
         # ============ РАБОЧИЕ КОДЕКИ ============
         codecs = {
             'lossy': 'XVID',        # Сжатый с потерями
             'lossless': 'HFYU',     # Без потерь
             'high_quality': 'MJPG', # Высокое качество (минимальные потери)
-            'png_frames': 'XVID'    # Видео + PNG
+            'png_frames': 'MJPG'    # Видео + PNG
         }
         self.fourcc = codecs.get(mode, 'XVID')
         
@@ -118,7 +118,7 @@ class VideoRecorder:
             fallback_codecs = {
                 'lossy': ['XVID', 'X264'],
                 'lossless': ['HFYU', 'FFV1'],
-                'high_quality': ['MJPG', 'XVID', 'X264'],
+                'high_quality': ['MJPG'],
                 'png_frames': ['MJPG']
             }
             
@@ -161,8 +161,8 @@ class VideoRecorder:
             return False
         
         current_time = time.time()
-        if current_time - self._last_frame_time < self._frame_interval:
-            return True
+        # if current_time - self._last_frame_time < self._frame_interval:
+        #     return True
         
         try:
             # ============ ПРОВЕРКА ФОРМАТА КАДРА ============

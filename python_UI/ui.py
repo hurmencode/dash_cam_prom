@@ -27,7 +27,7 @@ class CameraDiscoveryApp:
         except Exception as e:
             print(f"Не удалось загрузить иконку: {e}")
 
-        self.root.geometry("1600x700")
+        self.root.geometry("1200x700")
         
         # Переменные
         self.cameras = []
@@ -40,7 +40,7 @@ class CameraDiscoveryApp:
         self.frame_count = 0
         self.fps_start_time = time.time()
         self.current_fps = 0
-        self.fps_update_interval = 0.5
+        self.fps_update_interval = 0.3
         
         # Буфер для последнего кадра
         self.last_frame = None
@@ -52,6 +52,8 @@ class CameraDiscoveryApp:
         self.is_recording = False
         self.recording_thread = None
         self.current_record_path = None
+        self.osd_enabled = True
+        self.show_recording_indicator = True
         
         # Создаем интерфейс
         self.create_widgets()
@@ -665,7 +667,7 @@ class CameraDiscoveryApp:
             self.video_canvas.delete(self.canvas_image_id)
             self.canvas_image_id = None
         
-        self.fps_label.config(text="FPS: 0 | Родной: 0")
+        self.fps_label.config(text=f"FPS: {self.current_fps}")
         self.video_status.config(text="Статус: Видео остановлено")
         self.log_info("Видео поток остановлен")
     
@@ -675,6 +677,57 @@ class CameraDiscoveryApp:
                 frame = self.current_camera.get_frame()
                 
                 if frame is not None:
+                    # ============ НАЛОЖЕНИЕ OSD ============
+                    # Создаем копию кадра для OSD
+                    display_frame = frame.copy()
+                    
+                    # Получаем размеры
+                    height, width = display_frame.shape[:2]
+                    
+                    # Размер шрифта в зависимости от разрешения
+                    font_scale = width / 800
+                    font_thickness = max(1, int(font_scale * 2))
+                    
+                    if self.is_recording:
+                        # ===== ДЛИТЕЛЬНОСТЬ ЗАПИСИ =====
+                        if self.recording_start_time:
+                            elapsed = time.time() - self.recording_start_time
+                            self.recording_duration = elapsed
+                            
+                            # Форматируем время: HH:MM:SS
+                            hours = int(elapsed // 3600)
+                            minutes = int((elapsed % 3600) // 60)
+                            seconds = int(elapsed % 60)
+                            
+                            if hours > 0:
+                                time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                            else:
+                                time_str = f"{minutes:02d}:{seconds:02d}"
+                            
+                            # Позиция: справа сверху, под FPS
+                            time_pos = (width - int(150 * font_scale), int(40 * font_scale))
+                            
+                            # Текст времени
+                            cv2.putText(display_frame, time_str, time_pos, 
+                                    cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.7, 
+                                    (0, 255, 0), font_thickness, cv2.LINE_AA)
+                    # =====  FPS (всегда) =====
+                    fps_text = f"FPS: {self.current_fps:.1f}"
+                    fps_pos = (width - int(200 * font_scale), height - int(30 * font_scale))
+                    
+                    (text_w, text_h), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 
+                                                        font_scale * 0.5, font_thickness - 1)
+                    bg_rect = (fps_pos[0] - 10, fps_pos[1] - text_h - 10, 
+                            text_w + 20, text_h + 20)
+                    cv2.rectangle(display_frame, bg_rect, (0, 0, 0, 150), -1)
+                    
+                    cv2.putText(display_frame, fps_text, fps_pos, 
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.5, 
+                            (0, 255, 255), font_thickness - 1, cv2.LINE_AA)
+                    
+                    # ========================================
+                    
+                    # Обновляем счетчик FPS
                     self.frame_count += 1
                     
                     current_time = time.time()
@@ -686,11 +739,12 @@ class CameraDiscoveryApp:
                         self.fps_start_time = current_time
                         self.root.after(0, self._update_fps_display)
                     
-                    # Если идет запись - сохраняем кадр
+                    # Если идет запись - сохраняем кадр (оригинал, без OSD)
                     if self.is_recording and self.video_recorder:
-                        self.video_recorder.write_frame(frame)
+                        self.video_recorder.write_frame(frame)  # Сохраняем оригинал без OSD
                     
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Конвертируем для отображения (с OSD)
+                    frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
                     
                     height, width = frame_rgb.shape[:2]
                     max_width = self.video_frame.winfo_width() or 1024
@@ -702,7 +756,7 @@ class CameraDiscoveryApp:
                         new_height = int(height * scale)
                         if new_width > 0 and new_height > 0:
                             frame_rgb = cv2.resize(frame_rgb, (new_width, new_height), 
-                                                  interpolation=cv2.INTER_LINEAR)
+                                                interpolation=cv2.INTER_LINEAR)
                     
                     img = Image.fromarray(frame_rgb)
                     imgtk = ImageTk.PhotoImage(image=img)
@@ -750,28 +804,9 @@ class CameraDiscoveryApp:
         self.root.after(1, self.update_ui_loop)
     
     def _update_fps_display(self):
-        if self.is_streaming:
-            native_fps = 0
-            try:
-                if hasattr(self.current_camera, 'cap'):
-                    native_fps = self.current_camera.cap.get(cv2.CAP_PROP_FPS)
-                elif hasattr(self.current_camera, 'camera'):
-                    native_fps = 30
-            except:
-                pass
-            
             fps_text = f"FPS: {self.current_fps:.1f}"
-            if native_fps > 0:
-                fps_text += f" | Родной: {native_fps:.1f}"
             
             self.fps_label.config(text=fps_text)
-            
-            if self.current_fps >= native_fps * 0.9:
-                self.fps_label.config(foreground='#00ff00')
-            elif self.current_fps >= native_fps * 0.7:
-                self.fps_label.config(foreground='#ffa500')
-            else:
-                self.fps_label.config(foreground='#ff0000')
     
     # ============ МЕТОДЫ ЗАПИСИ ВИДЕО ============
     
@@ -803,13 +838,28 @@ class CameraDiscoveryApp:
             camera_info = self.current_camera.get_info()
             camera_name = camera_info.get('name', 'camera')
             
-            # Получаем размер кадра
-            frame = self.current_camera.get_frame()
-            if frame is None:
-                self.log_error("Не удалось получить кадр для определения размера")
-                return
+            # ============ ПОЛУЧАЕМ РАЗМЕР КАДРА ============
+            # Пробуем получить кадр несколько раз
+            frame = None
+            for attempt in range(5):
+                frame = self.current_camera.get_frame()
+                if frame is not None:
+                    break
+                time.sleep(0.1)
+                self.log_info(f"Попытка получения кадра {attempt + 1}/5...")
             
-            height, width = frame.shape[:2]
+            if frame is None:
+                # Если не удалось получить кадр, используем разрешение из настроек
+                if hasattr(self.current_camera, '_width') and hasattr(self.current_camera, '_height'):
+                    height = self.current_camera._height
+                    width = self.current_camera._width
+                    self.log_info(f"Используем разрешение из настроек: {width}x{height}\n")
+                else:
+                    self.log_error("Не удалось получить кадр для определения размера\n")
+                    return
+            else:
+                height, width = frame.shape[:2]
+                self.log_info(f"Разрешение кадра: {width}x{height}")
             
             # ============ ВЫБОР РЕЖИМА ЗАПИСИ ============
             mode_map = {
@@ -827,20 +877,24 @@ class CameraDiscoveryApp:
             # Создаем рекордер
             self.video_recorder = VideoRecorder(
                 output_dir=recordings_dir,
-                fps=min(30, int(self.current_fps) or 30),
+                fps=int(self.current_fps),
                 mode=record_mode
             )
             
             # Если выбран режим PNG - сохраняем каждый кадр как PNG
             if record_mode == 'png_frames':
                 self.video_recorder.save_frames_as_png = True
-                self.log_info("Включено сохранение кадров в PNG")
-            # =============================================
+                self.log_info("Включено сохранение кадров в PNG\n")
             
             # Запускаем запись
             self.current_record_path = self.video_recorder.start_recording(
                 width, height, camera_name
             )
+            
+            # ============ УСТАНАВЛИВАЕМ ВРЕМЯ НАЧАЛА ЗАПИСИ ============
+            self.recording_start_time = time.time()
+            self.recording_duration = 0
+            # ===========================================================
             
             self.is_recording = True
             self.record_btn.config(text="Остановить запись")
@@ -853,8 +907,8 @@ class CameraDiscoveryApp:
             self.video_status.config(text=f"Статус: Запись идет ({mode_display})...")
             
         except Exception as e:
-            self.log_error(f"Ошибка начала записи: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось начать запись: {e}")
+            self.log_error(f"Ошибка начала записи: {e}\n")
+            messagebox.showerror("Ошибка", f"Не удалось начать запись: {e}\n")
     
     def stop_recording(self):
         """Останавливает запись видео"""
@@ -864,6 +918,12 @@ class CameraDiscoveryApp:
         try:
             saved_path = self.video_recorder.stop_recording()
             self.is_recording = False
+            
+            # ============ СБРАСЫВАЕМ ТАЙМЕР ============
+            self.recording_start_time = None
+            self.recording_duration = 0
+            # ===========================================
+            
             self.video_recorder = None
             self.record_btn.config(text="Записать")
             self.recording_label.config(text="Запись: Нет", foreground="#3010c2")
@@ -872,9 +932,8 @@ class CameraDiscoveryApp:
                 self.log_success(f"Запись сохранена: {saved_path}")
                 self.video_status.config(text=f"Статус: Запись сохранена: {os.path.basename(saved_path)}")
                 
-                # Спрашиваем, хотите ли открыть папку
                 if messagebox.askyesno("Запись завершена", 
-                                       f"Видео сохранено в:\n{saved_path}\n\nОткрыть папку?"):
+                                    f"Видео сохранено в:\n{saved_path}\n\nОткрыть папку?"):
                     os.startfile(os.path.dirname(saved_path))
             else:
                 self.log_warning("Запись не была сохранена")
@@ -884,6 +943,7 @@ class CameraDiscoveryApp:
             self.log_error(f"Ошибка остановки записи: {e}")
             messagebox.showerror("Ошибка", f"Не удалось остановить запись: {e}")
             self.is_recording = False
+            self.recording_start_time = None
             self.video_recorder = None
             self.record_btn.config(text="Записать")
             self.recording_label.config(text="Запись: Нет", foreground="#3010c2")
