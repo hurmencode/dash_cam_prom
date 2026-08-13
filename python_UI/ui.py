@@ -809,6 +809,11 @@ class CameraDiscoveryApp:
             self.fps_label.config(text=fps_text)
     
     # ============ МЕТОДЫ ЗАПИСИ ВИДЕО ============
+
+    def save_video(self):
+        file_path = filedialog.askdirectory()
+        return file_path
+
     
     def toggle_recording(self):
         """Запускает или останавливает запись видео"""
@@ -831,8 +836,10 @@ class CameraDiscoveryApp:
         
         try:
             # Создаем папку для записей
-            recordings_dir = os.path.join(os.path.dirname(__file__), 'recordings')
-            os.makedirs(recordings_dir, exist_ok=True)
+            # recordings_dir = os.path.join(os.path.dirname(__file__), 'recordings')
+            # os.makedirs(recordings_dir, exist_ok=True)
+
+            recordings_dir = self.save_video()
             
             # Получаем информацию о камере
             camera_info = self.current_camera.get_info()
@@ -948,6 +955,10 @@ class CameraDiscoveryApp:
             self.record_btn.config(text="Записать")
             self.recording_label.config(text="Запись: Нет", foreground="#3010c2")
     
+    def save_snapshot(self):
+        file_path = filedialog.askdirectory()
+        return file_path
+
     def take_snapshot(self):
         if not self.is_streaming or not self.current_camera:
             messagebox.showwarning("Предупреждение", "Видео не запущено")
@@ -957,8 +968,7 @@ class CameraDiscoveryApp:
             frame = self.current_camera.get_frame()
             
             if frame is not None:
-                snapshots_dir = os.path.join(os.path.dirname(__file__), 'snapshots')
-                os.makedirs(snapshots_dir, exist_ok=True)
+                snapshots_dir = self.save_snapshot()
                 
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 camera_name = self.current_camera.get_info().get('name', 'camera')
