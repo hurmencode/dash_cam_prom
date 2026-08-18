@@ -27,7 +27,7 @@ class CameraDiscoveryApp:
         except Exception as e:
             print(f"Не удалось загрузить иконку: {e}")
 
-        self.root.geometry("1200x700")
+        self.root.geometry("1300x700")
         
         # Переменные
         self.cameras = []
@@ -252,7 +252,7 @@ class CameraDiscoveryApp:
                 'Кадры PNG (без потерь)'
             ],
             state='readonly',
-            width=50
+            width=35
         )
         mode_combo.pack(side=tk.LEFT, padx=5)
         
