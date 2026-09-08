@@ -7,7 +7,7 @@ Backend module for Dash Cam Prom
 from .camera_manager import (
     CameraInterface,
     WebcamManager,
-    LucidCameraManager,
+    ArvCameraManager,
     CameraScanner,
     create_camera
 )
@@ -16,7 +16,7 @@ from .camera_manager import (
 __all__ = [
     'CameraInterface',
     'WebcamManager', 
-    'LucidCameraManager',
+    'ArvCameraManager',
     'CameraScanner',
     'create_camera'
 ]

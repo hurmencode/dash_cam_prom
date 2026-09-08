@@ -11,6 +11,12 @@ from datetime import datetime
 import threading
 import queue
 
+# Импортируем Aravis
+import gi
+gi.require_version('Aravis', '0.10')
+from gi.repository import Aravis
+
+
 # ============ БАЗОВЫЙ ИНТЕРФЕЙС ============
 class CameraInterface(ABC):
     @abstractmethod
@@ -338,173 +344,125 @@ class WebcamManager(CameraInterface):
     def get_info(self) -> Dict:
         return self._info
 
-# ============ LUCID CAMERA MANAGER (ARENA API) ============
-class LucidCameraManager(CameraInterface):
+# ============ ARV CAMERA MANAGER (ARAVIS API) ============
+class ArvCameraManager(CameraInterface):
     def __init__(self, pixel_format: str = 'Mono8', device_index: int = 0, saved_ip: str = None):
-        from arena_api.system import system
-        self.system = system
         self.camera = None
+        self.stream = None
         self.pixel_format = pixel_format
         self.device_index = device_index
         self.saved_ip = saved_ip
         
         self._info = {
-            'name': 'Unknown Lucid',
+            'name': 'Unknown GenICam',
             'serial': 'Unknown',
             'ip': saved_ip if saved_ip else 'Unknown',
             'status': 'Disconnected'
         }
         self._connect_camera()
     
-    def _get_camera_ip(self) -> str:
-        try:
-            if self.saved_ip and self.saved_ip != 'Unknown':
-                return self.saved_ip
-            
-            ip_methods = ['DeviceIPAddress', 'GevCurrentIPAddress', 'GevPersistentIPAddress']
-            
-            for node_name in ip_methods:
-                try:
-                    node = self.camera.nodemap.get_node(node_name)
-                    if node:
-                        value = node.value
-                        if isinstance(value, int):
-                            ip_bytes = value.to_bytes(4, byteorder='big')
-                            return '.'.join(str(b) for b in ip_bytes)
-                        elif isinstance(value, str):
-                            return value
-                except:
-                    continue
-            
-            try:
-                if hasattr(self.camera, 'tl_device'):
-                    interface = str(self.camera.tl_device.interface)
-                    ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', interface)
-                    if ip_match:
-                        return ip_match.group(1)
-            except:
-                pass
-            
-            return 'Unknown'
-        except Exception as e:
-            print(f"Error getting camera IP: {e}\n")
-            return 'Unknown'
-    
     def _connect_camera(self):
         try:
-            devices = self.system.create_device()
+            Aravis.update_device_list()
+            n_devices = Aravis.get_n_devices()
             
-            if not devices:
-                raise RuntimeError("No Lucid Triton cameras found\n")
+            if n_devices == 0:
+                raise RuntimeError("No GenICam devices found via Aravis\n")
             
-            if self.device_index < len(devices):
-                self.camera = devices[self.device_index]
-            else:
-                self.camera = devices[0]
+            # Выбираем ID устройства по индексу
+            idx = self.device_index if self.device_index < n_devices else 0
+            device_id = Aravis.get_device_id(idx)
             
-            try:
-                model_name = self.camera.nodemap.get_node('DeviceModelName').value
-                serial = self.camera.nodemap.get_node('DeviceSerialNumber').value
-                ip_address = self._get_camera_ip()
-                
-                self._info = {
-                    'name': model_name,
-                    'serial': serial,
-                    'ip': ip_address,
-                    'status': 'Connected'
-                }
-                print(f"Connected: {model_name} (SN: {serial}, IP: {ip_address})\n")
-                
-            except Exception as e:
-                print(f"Error reading camera info: {e}\n")
-                self._info['status'] = 'Connected (Info Error)'
+            # Создаем объект камеры
+            self.camera = Aravis.Camera.new(device_id)
             
+            # Собираем метаданные через стандартные функции Aravis
+            model_name = self.camera.get_model_name()
+            serial = self.camera.get_device_serial_number()
+            
+            # Извлекаем IP
+            device = self.camera.get_device()
+            [_, ip, mask, gateway] = device.get_current_ip()
+            
+            self._info = {
+                'name': model_name,
+                'serial': serial,
+                'ip': ip.to_string(),
+                'status': 'Connected'
+            }
+            print(f"Connected Aravis: {model_name} (SN: {serial}, IP: {ip.to_string()})\n")
+            
+            # Установка формата пикселей
             if self.pixel_format:
                 try:
-                    self.camera.nodemap.get_node('PixelFormat').value = self.pixel_format
-                except:
-                    pass
+                    self.camera.set_pixel_format_from_string(self.pixel_format)
+                except Exception as e:
+                    print(f"Could not set pixel format {self.pixel_format}: {e}")
             
-            self.camera.start_stream()
+            # Настройка потока и выделение буферов
+            self.stream = self.camera.create_stream(None, None)
+            payload = self.camera.get_payload()
+            for _ in range(5):
+                self.stream.push_buffer(Aravis.Buffer.new_allocate(payload))
+            
+            # Запуск трансляции
+            self.camera.start_acquisition()
             
         except Exception as e:
-            print(f"Error connecting to Lucid camera: {e}\n")
+            print(f"Error connecting to Aravis camera: {e}\n")
             self._info['status'] = f'Error: {str(e)[:50]}'
             raise
     
     def get_frame(self) -> Optional[np.ndarray]:
-        if not self.camera:
+        if not self.stream:
             return None
             
-        buffer = self.camera.get_buffer()
+        # Запрашиваем буфер (таймаут 1 секунда = 1 000 000 мкс)
+        buffer = self.stream.timeout_pop_buffer(1000000)
         if buffer is None:
             return None
         
+        frame = None
         try:
-            height, width = buffer.height, buffer.width
-            img_array = np.ctypeslib.as_array(buffer.pdata, shape=(height, width))
-            frame = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+            if buffer.get_status() == Aravis.BufferStatus.SUCCESS:
+                # Извлекаем сырые данные
+                data = buffer.get_data() 
+                
+                # Получаем геометрию кадра из буфера
+                try:
+                    width = buffer.get_image_width()
+                    height = buffer.get_image_height()
+                except AttributeError:
+                    # Для более новых версий API Aravis:
+                    _, _, width, height = buffer.get_image_region()
+                
+                # Преобразуем данные в numpy array
+                img_array = np.frombuffer(data, dtype=np.uint8).reshape((height, width))
+                frame = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
         except Exception as e:
             print(f"Frame conversion error: {e}\n")
             frame = None
         finally:
-            self.camera.requeue_buffer(buffer)
+            # Обязательно возвращаем буфер обратно в поток очереди Aravis
+            self.stream.push_buffer(buffer)
         
         return frame
     
     def release(self):
         if self.camera:
             try:
-                self.camera.stop_stream()
-                self.system.destroy_device()
-            except:
-                pass
+                self.camera.stop_acquisition()
+                self.stream.set_emit_signals(False)
+                self.stream = None
+                self.camera = None
+            except Exception as e:
+                print(f"Error releasing Aravis camera: {e}")
     
     def get_info(self) -> Dict:
         return self._info
 
 # ============ СКАНЕР КАМЕР ============
 class CameraScanner:
-    @staticmethod
-    def _extract_ip_from_device(device) -> str:
-        try:
-            try:
-                node = device.nodemap.get_node('DeviceIPAddress')
-                if node:
-                    value = node.value
-                    if isinstance(value, int):
-                        ip_bytes = value.to_bytes(4, byteorder='big')
-                        return '.'.join(str(b) for b in ip_bytes)
-                    elif isinstance(value, str):
-                        return value
-            except:
-                pass
-            
-            try:
-                node = device.nodemap.get_node('GevCurrentIPAddress')
-                if node:
-                    value = node.value
-                    if isinstance(value, int):
-                        ip_bytes = value.to_bytes(4, byteorder='big')
-                        return '.'.join(str(b) for b in ip_bytes)
-                    elif isinstance(value, str):
-                        return value
-            except:
-                pass
-            
-            try:
-                if hasattr(device, 'tl_device'):
-                    interface = str(device.tl_device.interface)
-                    ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', interface)
-                    if ip_match:
-                        return ip_match.group(1)
-            except:
-                pass
-            
-            return 'Unknown'
-        except:
-            return 'Unknown'
-    
     @staticmethod
     def scan_webcams(max_devices: int = 10) -> List[Dict]:
         cameras = []
@@ -532,56 +490,52 @@ class CameraScanner:
         return cameras
     
     @staticmethod
-    def scan_lucid_cameras() -> List[Dict]:
+    def scan_aravis_cameras() -> List[Dict]:
         cameras = []
         try:
-            from arena_api.system import system
-            devices = system.create_device()
+            # Обновляем список устройств в Aravis
+            Aravis.update_device_list()
+            n_devices = Aravis.get_n_devices()
             
-            if not devices:
-                print("No Lucid devices found\n")
+            if n_devices == 0:
+                print("No Aravis devices found\n")
                 return cameras
             
-            for idx, device in enumerate(devices):
+            for idx in range(n_devices):
                 try:
-                    model_name = device.nodemap.get_node('DeviceModelName').value
-                    serial = device.nodemap.get_node('DeviceSerialNumber').value
-                    ip_address = CameraScanner._extract_ip_from_device(device)
+                    # Получаем уникальный строковый ID устройства 
+                    device_id = Aravis.get_device_id(idx)
+                    camera = Aravis.Camera.new(device_id)
                     
-                    print(f"Found Lucid camera: {model_name} (SN: {serial}, IP: {ip_address})\n")
+                    # Получение модели, вендора и серийника в Aravis API
+                    model_name = Aravis.get_device_model(idx) if hasattr(Aravis, 'get_device_model') else "GenICam Camera"
+                    
+                    # Извлекаем серийный номер (если метод доступен глобально, иначе ставим N/A)
+                    serial = camera.get_device_serial_number()
+                    
+                    # Извлекаем IP-адрес
+                    device = camera.get_device()
+                    [_, ip, mask, gateway] = device.get_current_ip()
+                    
+                    print(f"Found Aravis camera: {model_name} (SN: {serial}, IP: {ip.to_string()})\n")
                     
                     cameras.append({
-                        'name': model_name,
+                        'name': f"{model_name} [{idx}]",
                         'serial': serial,
-                        'ip': ip_address,
+                        'ip': ip.to_string(),
                         'status': 'Available',
-                        'type': 'lucid',
+                        'type': 'aravis',
                         'device_id': idx,
-                        'device': device,
-                        '_saved_ip': ip_address
+                        '_saved_ip': ip.to_string()
                     })
-                    
                 except Exception as e:
-                    print(f"Error reading Lucid camera info: {e}\n")
-                    cameras.append({
-                        'name': f'Lucid Camera {idx}',
-                        'serial': 'Unknown',
-                        'ip': 'Unknown',
-                        'status': 'Available',
-                        'type': 'lucid',
-                        'device_id': idx,
-                        'device': device,
-                        '_saved_ip': 'Unknown'
-                    })
+                    print(f"Error reading Aravis camera info at index {idx}: {e}\n")
             
-            system.destroy_device()
-            
-        except ImportError:
-            print("Arena SDK not installed\n")
         except Exception as e:
-            print(f"Error scanning Lucid cameras: {e}\n")
+            print(f"Error scanning Aravis cameras: {e}\n")
         
         return cameras
+
     
     @staticmethod
     def scan_all() -> List[Dict]:
@@ -592,10 +546,10 @@ class CameraScanner:
         all_cameras.extend(webcams)
         print(f"Found {len(webcams)} webcams\n")
         
-        print("Scanning Lucid cameras...\n")
-        lucid_cams = CameraScanner.scan_lucid_cameras()
-        all_cameras.extend(lucid_cams)
-        print(f"Found {len(lucid_cams)} Lucid cameras\n")
+        print("Scanning Aravis cameras...\n")
+        arv_cams = CameraScanner.scan_aravis_cameras() # Вызов нового сканера вместо scan_lucid_cameras
+        all_cameras.extend(arv_cams)
+        print(f"Found {len(arv_cams)} Aravis cameras\n")
         
         return all_cameras
 
@@ -603,9 +557,9 @@ class CameraScanner:
 def create_camera(camera_type: str = "webcam", **kwargs) -> CameraInterface:
     if camera_type == "webcam":
         return WebcamManager(device_id=kwargs.get("device_id", 0))
-    elif camera_type == "lucid":
+    elif camera_type in ("gige", "aravis"):
         saved_ip = kwargs.get("saved_ip", None)
-        return LucidCameraManager(
+        return ArvCameraManager(
             pixel_format=kwargs.get("pixel_format", "Mono8"),
             device_index=kwargs.get("device_id", 0),
             saved_ip=saved_ip

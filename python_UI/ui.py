@@ -4,6 +4,8 @@ import cv2
 from datetime import datetime
 import os
 from PIL import Image, ImageTk
+import platform
+import subprocess
 import sys
 import time
 import tkinter as tk
@@ -434,7 +436,8 @@ class CameraDiscoveryApp:
     def get_type_display(self, camera_type: str) -> str:
         type_map = {
             'webcam': 'USB',
-            'lucid': 'GigE',
+            'gige' : 'GigE',
+            'aravis': 'GigE',
             'unknown': 'Unknown'
         }
         return type_map.get(camera_type, camera_type.upper())
@@ -561,19 +564,17 @@ class CameraDiscoveryApp:
             if camera_type == 'webcam':
                 self.current_camera = create_camera('webcam', device_id=device_id)
                 self.log_info(f"Создан объект WebcamManager с ID {device_id}")
-            elif camera_type == 'lucid':
-                identifier = self.selected_camera.get('ip', None)
-                if identifier == 'Unknown' or identifier == 'N/A':
-                    identifier = None
+            elif camera_type in ('gige', 'aravis'):  # Поддерживаем оба типа для совместимости таблицы
+                # Извлечем сохраненный IP или передадим ID устройства для Aravis
                 self.current_camera = create_camera(
-                    'lucid',
-                    identifier=identifier,
+                    'gige',  # Вызываем обновленную фабрику по gige/aravis ключу
+                    device_id=device_id,  # Передаем индекс устройства
+                    saved_ip=saved_ip,
                     pixel_format="Mono8"
                 )
             else:
                 self.log_error(f"Неизвестный тип камеры: {camera_type}")
-                messagebox.showerror("Ошибка", f"Неизвестный тип камеры: {camera_type}")
-                return
+
             
             self._update_camera_status(camera_name, 'Connected')
             
@@ -835,10 +836,6 @@ class CameraDiscoveryApp:
             return
         
         try:
-            # Создаем папку для записей
-            # recordings_dir = os.path.join(os.path.dirname(__file__), 'recordings')
-            # os.makedirs(recordings_dir, exist_ok=True)
-
             recordings_dir = self.save_video()
             
             # Получаем информацию о камере
@@ -941,7 +938,14 @@ class CameraDiscoveryApp:
                 
                 if messagebox.askyesno("Запись завершена", 
                                     f"Видео сохранено в:\n{saved_path}\n\nОткрыть папку?"):
-                    os.startfile(os.path.dirname(saved_path))
+                    # КРОССПЛАТФОРМЕННЫЙ ВЫЗОВ ОТКРЫТИЯ ПАПКИ
+                    dir_path = os.path.dirname(saved_path)
+                    if platform.system() == 'Windows':
+                        os.startfile(dir_path)
+                    elif platform.system() == 'Darwin':  # macOS
+                        subprocess.Popen(['open', dir_path])
+                    else:  # Linux
+                        subprocess.Popen(['xdg-open', dir_path])
             else:
                 self.log_warning("Запись не была сохранена")
                 self.video_status.config(text="Статус: Запись не сохранена")
@@ -954,6 +958,7 @@ class CameraDiscoveryApp:
             self.video_recorder = None
             self.record_btn.config(text="Записать")
             self.recording_label.config(text="Запись: Нет", foreground="#3010c2")
+
     
     def save_snapshot(self):
         file_path = filedialog.askdirectory()
@@ -969,6 +974,8 @@ class CameraDiscoveryApp:
             
             if frame is not None:
                 snapshots_dir = self.save_snapshot()
+                if not snapshots_dir:  # Если пользователь отменил выбор папки
+                    return
                 
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 camera_name = self.current_camera.get_info().get('name', 'camera')
@@ -981,7 +988,13 @@ class CameraDiscoveryApp:
                 
                 if messagebox.askyesno("Снимок сохранен", 
                                        f"Снимок сохранен в:\n{filepath}\n\nОткрыть папку?"):
-                    os.startfile(snapshots_dir)
+                    # КРОССПЛАТФОРМЕННЫЙ ВЫЗОВ ОТКРЫТИЯ ПАПКИ
+                    if platform.system() == 'Windows':
+                        os.startfile(snapshots_dir)
+                    elif platform.system() == 'Darwin':  # macOS
+                        subprocess.Popen(['open', snapshots_dir])
+                    else:  # Linux
+                        subprocess.Popen(['xdg-open', snapshots_dir])
             else:
                 self.log_warning("Не удалось получить кадр для снимка")
                 messagebox.showwarning("Предупреждение", "Не удалось получить кадр")
