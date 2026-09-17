@@ -39,8 +39,8 @@ class CameraDiscoveryApp:
         self.video_thread = None
 
         # Отображение
-        self.display_enabled = False          # рисуем ли кадры в канвас
-        self.user_wants_display = False       # хочет ли пользователь видеть поток
+        self.display_enabled = False
+        self.user_wants_display = False
 
         # FPS
         self.frame_count = 0
@@ -48,12 +48,12 @@ class CameraDiscoveryApp:
         self.current_fps = 0.0
         self.fps_update_interval = 0.5
 
-        # Буфер кадра (между потоком захвата и main-потоком)
+        # Буфер кадра
         self.last_frame_bgr = None
         self.frame_lock = Lock()
         self.frame_ready = False
 
-        # Размер кадра, известный из захвата
+        # Размер кадра
         self._frame_size = None
 
         # Запись
@@ -63,19 +63,19 @@ class CameraDiscoveryApp:
         self.recording_start_time = None
         self.recording_duration = 0
 
-        # Идентификатор картинки на канвасе
+        # Канвас
         self.canvas_image_id = None
 
-        # Создаём интерфейс
+        # Интерфейс
         self.create_widgets()
 
         # Автопоиск
         self.root.after(500, self.scan_cameras)
 
-        # Запускаем UI-цикл (единожды!)
+        # UI-цикл
         self.root.after(30, self.update_ui_loop)
 
-        # Обработчик закрытия
+        # Закрытие
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     # ============ ЗАКРЫТИЕ ============
@@ -182,7 +182,7 @@ class CameraDiscoveryApp:
 
         self.fps_label = ttk.Label(
             controls_frame, text="FPS: 0",
-            font=('Arial', 10, 'bold'), foreground='#00ff00'
+            font=('Arial', 10, 'bold'), foreground="#000000"
         )
         self.fps_label.pack(side=tk.LEFT, padx=20)
 
@@ -361,7 +361,9 @@ class CameraDiscoveryApp:
         try:
             self.cameras = CameraScanner.scan_all()
             self.root.after(0, self._update_camera_list)
-            self.log_success(f"Сканирование завершено. Найдено камер: {len(self.cameras)}")
+            self.log_success(
+                f"Сканирование завершено. Найдено камер: {len(self.cameras)}"
+            )
         except Exception as e:
             error_msg = f"Ошибка сканирования: {e}"
             self.log_error(error_msg)
@@ -432,9 +434,13 @@ class CameraDiscoveryApp:
                 type_display = self.get_type_display(camera_type)
 
                 self.status_bar.config(
-                    text=f"Выбрана: {name} | Тип: {type_display} | SN: {serial} | IP: {ip}"
+                    text=f"Выбрана: {name} | Тип: {type_display} "
+                         f"| SN: {serial} | IP: {ip}"
                 )
-                self.log_info(f"Выбрана камера: {name} (Тип: {type_display}, SN: {serial})")
+                self.log_info(
+                    f"Выбрана камера: {name} "
+                    f"(Тип: {type_display}, SN: {serial})"
+                )
             else:
                 self.connect_btn.config(state=tk.DISABLED)
 
@@ -474,20 +480,27 @@ class CameraDiscoveryApp:
             type_display = self.get_type_display(camera_type)
             info_msg = f"Подключено к камере: {camera_name}\n"
             info_msg += f"Тип: {type_display}\n"
-            info_msg += f"Серийный номер: {self.selected_camera.get('serial', 'N/A')}\n"
+            info_msg += (f"Серийный номер: "
+                         f"{self.selected_camera.get('serial', 'N/A')}\n")
             if ip not in ('N/A', 'Unknown'):
                 info_msg += f"IP-адрес: {ip}"
 
             self.log_success(f"Успешно подключено к {camera_name} (IP: {ip})")
             messagebox.showinfo("Успешно", info_msg)
-            self.status_bar.config(text=f"Подключено: {camera_name} (Тип: {type_display})")
+            self.status_bar.config(
+                text=f"Подключено: {camera_name} (Тип: {type_display})"
+            )
 
             self.show_video_btn.config(state=tk.NORMAL)
             self.video_control_btn.config(state=tk.NORMAL)
             self.snapshot_btn.config(state=tk.NORMAL)
             self.record_btn.config(state=tk.NORMAL)
-            self.video_info_label.config(text=f"Камера: {camera_name} ({type_display})")
-            self.video_status.config(text=f"Статус: Подключено к {camera_name}")
+            self.video_info_label.config(
+                text=f"Камера: {camera_name} ({type_display})"
+            )
+            self.video_status.config(
+                text=f"Статус: Подключено к {camera_name}"
+            )
 
         except Exception as e:
             error_msg = f"Не удалось подключиться: {e}"
@@ -578,74 +591,68 @@ class CameraDiscoveryApp:
             self.log_info("Видео поток остановлен")
 
     def _capture_loop(self):
-        """Фоновый поток захвата. НЕ трогает Tkinter."""
+        """Фоновый поток захвата. Не трогает Tkinter."""
         while self.is_streaming and self.current_camera:
             try:
                 frame = self.current_camera.get_frame()
                 if frame is None:
-                    time.sleep(0.001)
                     continue
 
-                # Запоминаем размер кадра (для старта записи)
+                # Размер кадра
                 if self._frame_size is None:
                     self._frame_size = (frame.shape[1], frame.shape[0])
 
                 # FPS
                 self.frame_count += 1
                 now = time.time()
-                elapsed = now - self.fps_start_time
-                if elapsed >= self.fps_update_interval:
-                    self.current_fps = self.frame_count / elapsed
+                if now - self.fps_start_time >= self.fps_update_interval:
+                    self.current_fps = (
+                        self.frame_count / (now - self.fps_start_time)
+                    )
                     self.frame_count = 0
                     self.fps_start_time = now
 
-                # Запись (синхронно, оригинал без OSD)
+                # Запись (Mono8, isColor=False)
                 if self.is_recording and self.video_recorder:
                     self.video_recorder.write_frame(frame)
 
-                # Отображение — только готовим numpy-массив
+                # Отображение: Mono8 -> BGR только для показа
                 if self.display_enabled:
-                    display = frame
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-                    h, w = display.shape[:2]
-                    font_scale = max(0.4, w / 1600.0)
-                    thickness = max(1, int(font_scale * 2))
-
-                    # Время записи
-                    if self.is_recording and self.recording_start_time:
-                        e = time.time() - self.recording_start_time
-                        hh = int(e // 3600)
-                        mm = int((e % 3600) // 60)
-                        ss = int(e % 60)
-                        tstr = (f"{hh:02d}:{mm:02d}:{ss:02d}"
-                                if hh > 0 else f"{mm:02d}:{ss:02d}")
-                        cv2.putText(
-                            display, tstr,
-                            (int(w - 170 * font_scale), int(40 * font_scale)),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.7,
-                            (0, 255, 0), thickness, cv2.LINE_AA
-                        )
-
-                    # FPS
-                    fps_text = f"FPS: {self.current_fps:.1f}"
-                    cv2.putText(
-                        display, fps_text,
-                        (int(10 * font_scale), int(30 * font_scale)),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.6,
-                        (0, 255, 255), thickness, cv2.LINE_AA
-                    )
-
-                    # Уменьшаем до фиксированного максимума (без winfo!)
-                    max_w, max_h = 1280, 720
+                    h, w = frame_bgr.shape[:2]
+                    max_w, max_h = 960, 540
                     if w > max_w or h > max_h:
                         s = min(max_w / w, max_h / h)
                         display = cv2.resize(
-                            display, (int(w * s), int(h * s)),
+                            frame_bgr, (int(w * s), int(h * s)),
                             interpolation=cv2.INTER_AREA
                         )
+                    else:
+                        display = frame_bgr
+
+                    dh, dw = display.shape[:2]
+                    font_scale = 0.6
+                    thickness = 1
+
+                    if self.is_recording and self.recording_start_time:
+                        e = time.time() - self.recording_start_time
+                        hh, mm, ss = (int(e // 3600),
+                                      int((e % 3600) // 60),
+                                      int(e % 60))
+                        tstr = (f"{hh:02d}:{mm:02d}:{ss:02d}"
+                                if hh else f"{mm:02d}:{ss:02d}")
+                        cv2.putText(display, tstr, (dw - 140, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                                    (0, 255, 0), thickness, cv2.LINE_AA)
+
+                    cv2.putText(display, f"FPS: {self.current_fps:.1f}",
+                                (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                                (0, 255, 255), thickness, cv2.LINE_AA)
 
                     with self.frame_lock:
-                        self.last_frame_bgr = display.copy()
+                        self.last_frame_bgr = display
                         self.frame_ready = True
 
             except Exception as e:
@@ -654,7 +661,7 @@ class CameraDiscoveryApp:
                 break
 
     def update_ui_loop(self):
-        """Main-поток. Тут и только тут трогаем Tkinter."""
+        """Main-поток. Единственное место работы с Tkinter."""
         try:
             if self.is_streaming and self.display_enabled and self.frame_ready:
                 with self.frame_lock:
@@ -679,19 +686,17 @@ class CameraDiscoveryApp:
                     self.canvas_image_id = self.video_canvas.create_image(
                         x, y, anchor=tk.NW, image=imgtk
                     )
-                    # защита от GC
                     self.video_canvas.image = imgtk
 
                     self.video_status.config(text="Статус: Видео идет")
 
-            # FPS-метка обновляется всегда (main-поток)
             if self.is_streaming:
                 self.fps_label.config(text=f"FPS: {self.current_fps:.1f}")
 
         except Exception as e:
             print(f"UI loop error: {e}")
 
-        self.root.after(30, self.update_ui_loop)
+        self.root.after(66, self.update_ui_loop)
 
     # ============ ЗАПИСЬ ============
     def save_video(self):
@@ -744,11 +749,10 @@ class CameraDiscoveryApp:
                 self.video_control_btn.config(text="Остановить видео")
                 self.log_info("Захват запущен (без отображения)")
 
-            # Ждём появления размера кадра (без блокировки UI)
+            # Ждём появления размера кадра
             self.video_status.config(text="Статус: Инициализация записи...")
             self.root.update_idletasks()
 
-            # Ждём максимум 3 сек через маленькие after-шаги
             start_wait = time.time()
             while self._frame_size is None and (time.time() - start_wait) < 3.0:
                 time.sleep(0.02)
@@ -761,13 +765,16 @@ class CameraDiscoveryApp:
             width, height = self._frame_size
             self.log_info(f"Разрешение кадра: {width}x{height}")
 
-            # FPS: измеренный или 30 по умолчанию
+            # FPS: измеренный, БЕЗ округления
             target_fps = int(self.current_fps) if self.current_fps >= 5 else 30
-            self.log_info(f"FPS записи: {target_fps}")
+            self.log_info(
+                f"FPS записи: {target_fps} (измеренный {self.current_fps:.1f})"
+            )
 
             self.video_recorder = VideoRecorder(
                 output_dir=recordings_dir,
-                fps=target_fps
+                fps=target_fps,
+                is_color=False   # Mono8
             )
 
             self.current_record_path = self.video_recorder.start_recording(
@@ -780,7 +787,9 @@ class CameraDiscoveryApp:
             self.record_btn.config(text="Остановить запись")
             self.recording_label.config(text="Запись: ИДЕТ", foreground='#ff0000')
             self.log_success(f"Запись начата: {self.current_record_path}")
-            self.video_status.config(text="Статус: Запись идет (отображение выкл.)")
+            self.video_status.config(
+                text="Статус: Запись идет (отображение выкл.)"
+            )
 
         except Exception as e:
             self.log_error(f"Ошибка начала записи: {e}")
@@ -808,7 +817,8 @@ class CameraDiscoveryApp:
             if saved_path:
                 self.log_success(f"Запись сохранена: {saved_path}")
                 self.video_status.config(
-                    text=f"Статус: Запись сохранена: {os.path.basename(saved_path)}"
+                    text=f"Статус: Запись сохранена: "
+                         f"{os.path.basename(saved_path)}"
                 )
                 if messagebox.askyesno(
                     "Запись завершена",
@@ -832,7 +842,9 @@ class CameraDiscoveryApp:
             self.recording_start_time = None
             self.video_recorder = None
             self.record_btn.config(text="Записать")
-            self.recording_label.config(text="Запись: Нет", foreground="#3010c2")
+            self.recording_label.config(
+                text="Запись: Нет", foreground="#3010c2"
+            )
 
     # ============ СНИМОК ============
     def save_snapshot(self):
@@ -859,6 +871,7 @@ class CameraDiscoveryApp:
             filename = f"{safe_name}_{timestamp}.png"
             filepath = os.path.join(snapshots_dir, filename)
 
+            # Mono8 PNG
             cv2.imwrite(filepath, frame)
             self.log_success(f"Снимок сохранен: {filepath}")
 

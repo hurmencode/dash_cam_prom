@@ -3,20 +3,14 @@ import cv2
 import numpy as np
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict
-import platform
 import re
 import time
 from datetime import datetime
-import threading
-import queue
 
 # Импортируем Aravis
 import gi
 gi.require_version('Aravis', '0.10')
 from gi.repository import Aravis
-
-# Оптимизация OpenCV под многоядерный CPU Jetson
-cv2.setNumThreads(4)
 
 
 # ============ БАЗОВЫЙ ИНТЕРФЕЙС ============
@@ -34,88 +28,105 @@ class CameraInterface(ABC):
         pass
 
 
-# ============ ВИДЕОРЕКОРДЕР (только XVID, асинхронная запись) ============
+# ============ ВИДЕОРЕКОРДЕР (GStreamer x264enc, fallback MJPG) ============
 class VideoRecorder:
     """
-    Рекордер только в XVID (lossy).
-    Запись вынесена в отдельный поток с очередью — не блокирует захват.
+    Рекордер на GStreamer + x264enc (программный кодек).
+    GStreamer сам управляет PTS — нет segfault'ов при закрытии.
+    Fallback на MJPG, если GStreamer не собран в OpenCV.
     """
 
-    def __init__(self, output_dir: str = "recordings", fps: int = 30):
+    def __init__(self, output_dir: str = "recordings", fps: int = 30,
+                 is_color: bool = False):
         self.output_dir = output_dir
         self.fps = max(1, int(fps))
+        self.is_color = is_color
         self.writer = None
         self.is_recording = False
         self.record_path = None
-        self.frame_width = None
-        self.frame_height = None
         self.recording_start_time = None
         self.frame_count = 0
-
-        # Асинхронная очередь записи
-        self._write_queue = queue.Queue(maxsize=120)
-        self._writer_thread = None
-        self._writer_running = False
-        self._dropped_frames = 0
+        self.codec = None
 
         os.makedirs(output_dir, exist_ok=True)
 
-    # ---------- публичные методы ----------
-    def start_recording(self, width: int, height: int, camera_name: str = "camera") -> str:
+    def _build_gst_pipeline(self, width, height, path):
+        fmt = "BGR" if self.is_color else "GRAY8"
+        return (
+            f"appsrc ! video/x-raw,format={fmt} ! "
+            f"videoconvert ! video/x-raw,format=I420 ! "
+            f"x264enc speed-preset=ultrafast tune=zerolatency "
+            f"key-int-max=30 bitrate=5000 ! "
+            f"h264parse ! mp4mux ! filesink location={path}"
+        )
+
+    def start_recording(self, width: int, height: int,
+                        camera_name: str = "camera") -> str:
         if self.is_recording:
             return self.record_path
 
-        self.frame_width = width
-        self.frame_height = height
-        self.frame_count = 0
-        self._dropped_frames = 0
-
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = re.sub(r'[^\w\-_\. ]', '_', camera_name)
-        filename = f"{safe_name}_{timestamp}_xvid.avi"
-        self.record_path = os.path.join(self.output_dir, filename)
 
-        # XVID
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        self.writer = cv2.VideoWriter(
-            self.record_path,
-            fourcc,
-            self.fps,
-            (width, height)
-        )
+        # Пробуем GStreamer + x264enc
+        mp4_path = os.path.join(self.output_dir,
+                                f"{safe_name}_{timestamp}.mp4")
+        pipeline = self._build_gst_pipeline(width, height, mp4_path)
 
-        # Fallback на MJPG если XVID недоступен
-        if not self.writer.isOpened():
-            print("XVID недоступен, используем MJPG\n")
+        try:
+            self.writer = cv2.VideoWriter(
+                pipeline, cv2.CAP_GSTREAMER, 0, self.fps,
+                (width, height), isColor=self.is_color
+            )
+            if self.writer.isOpened():
+                self.record_path = mp4_path
+                self.codec = "x264enc (GStreamer)"
+            else:
+                self.writer = None
+        except Exception as e:
+            print(f"GStreamer pipeline error: {e}\n")
+            self.writer = None
+
+        # Fallback на MJPG
+        if self.writer is None:
+            print("GStreamer недоступен, fallback на MJPG\n")
+            avi_path = os.path.join(self.output_dir,
+                                    f"{safe_name}_{timestamp}_mjpg.avi")
             fourcc = cv2.VideoWriter_fourcc(*'MJPG')
             self.writer = cv2.VideoWriter(
-                self.record_path, fourcc, self.fps, (width, height)
+                avi_path, fourcc, self.fps,
+                (width, height), isColor=self.is_color
             )
+            if self.writer.isOpened():
+                self.record_path = avi_path
+                self.codec = "MJPG"
+            else:
+                self.writer = None
 
-        if not self.writer.isOpened():
-            raise RuntimeError(f"Failed to create video writer: {self.record_path}\n")
+        if self.writer is None or not self.writer.isOpened():
+            raise RuntimeError("Не удалось создать VideoWriter (ни GStreamer, ни MJPG)\n")
 
         self.is_recording = True
         self.recording_start_time = time.time()
-
-        # Запускаем поток-писатель
-        self._writer_running = True
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop, daemon=True
-        )
-        self._writer_thread.start()
+        self.frame_count = 0
 
         print(f"Запись начата: {self.record_path}\n")
-        print(f"   Кодек: XVID, FPS: {self.fps}\n")
+        print(f"   Кодек: {self.codec}, "
+              f"{width}x{height}, isColor={self.is_color}, fps={self.fps}\n")
         return self.record_path
 
-    def write_frame(self, frame):
-        if not self.is_recording or self.writer is None:
+    def write_frame(self, frame: np.ndarray) -> bool:
+        if self.writer is None or not self.is_recording:
             return False
-        # Пишем прямо в текущем потоке, без отдельного writer-thread
-        self.writer.write(frame)
-        self.frame_count += 1
-        return True
+        if frame is None:
+            return False
+        try:
+            self.writer.write(frame)
+            self.frame_count += 1
+            return True
+        except Exception as e:
+            print(f"Error writing frame: {e}\n")
+            return False
 
     def stop_recording(self) -> Optional[str]:
         if not self.is_recording:
@@ -123,28 +134,23 @@ class VideoRecorder:
 
         self.is_recording = False
 
-        # Ждём, пока очередь опустеет (макс 5 сек)
-        deadline = time.time() + 5.0
-        while not self._write_queue.empty() and time.time() < deadline:
-            time.sleep(0.05)
-
-        self._writer_running = False
-        if self._writer_thread:
-            self._writer_thread.join(timeout=3)
-            self._writer_thread = None
+        # Даём GStreamer/OpenCV время дописать буфер
+        time.sleep(0.3)
 
         if self.writer:
             self.writer.release()
             self.writer = None
 
             duration = time.time() - self.recording_start_time
-            file_size = os.path.getsize(self.record_path) / (1024 * 1024)
+            try:
+                file_size = os.path.getsize(self.record_path) / (1024 * 1024)
+            except OSError:
+                file_size = 0.0
 
             print(f"Запись остановлена: {self.record_path}\n")
             print(f"   Кадров: {self.frame_count}\n")
-            print(f"   Дропнуто: {self._dropped_frames}\n")
             print(f"   Длительность: {duration:.1f} сек\n")
-            print(f"   Размер видео: {file_size:.1f} MB\n")
+            print(f"   Размер видео: {file_size:.2f} MB\n")
             return self.record_path
 
         return None
@@ -153,35 +159,19 @@ class VideoRecorder:
         return {
             'is_recording': self.is_recording,
             'file_path': self.record_path,
-            'duration': time.time() - self.recording_start_time if self.recording_start_time else 0,
+            'duration': (time.time() - self.recording_start_time
+                         if self.recording_start_time else 0),
             'fps': self.fps,
             'frame_count': self.frame_count,
-            'dropped_frames': self._dropped_frames,
-            'fourcc': 'XVID'
+            'codec': self.codec,
+            'is_color': self.is_color
         }
-
-    # ---------- внутренний поток ----------
-    def _writer_loop(self):
-        """Пишет кадры в файл в отдельном потоке."""
-        while self._writer_running or not self._write_queue.empty():
-            try:
-                frame = self._write_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            try:
-                if self.writer is not None:
-                    self.writer.write(frame)
-                    self.frame_count += 1
-            except Exception as e:
-                print(f"Error writing frame: {e}\n")
-            finally:
-                self._write_queue.task_done()
 
 
 # ============ ARV CAMERA MANAGER (ARAVIS API) ============
 class ArvCameraManager(CameraInterface):
-    def __init__(self, pixel_format: str = 'Mono8', device_index: int = 0, saved_ip: str = None):
+    def __init__(self, pixel_format: str = 'Mono8',
+                 device_index: int = 0, saved_ip: str = None):
         self.camera = None
         self.stream = None
         self.pixel_format = pixel_format
@@ -221,7 +211,8 @@ class ArvCameraManager(CameraInterface):
                 'ip': ip.to_string(),
                 'status': 'Connected'
             }
-            print(f"Connected Aravis: {model_name} (SN: {serial}, IP: {ip.to_string()})\n")
+            print(f"Connected Aravis: {model_name} "
+                  f"(SN: {serial}, IP: {ip.to_string()})\n")
 
             if self.pixel_format:
                 try:
@@ -231,7 +222,7 @@ class ArvCameraManager(CameraInterface):
 
             self.stream = self.camera.create_stream(None, None)
             payload = self.camera.get_payload()
-            for _ in range(10):  # больше буферов — меньше пропусков
+            for _ in range(10):
                 self.stream.push_buffer(Aravis.Buffer.new_allocate(payload))
 
             self.camera.start_acquisition()
@@ -242,6 +233,7 @@ class ArvCameraManager(CameraInterface):
             raise
 
     def get_frame(self) -> Optional[np.ndarray]:
+        """Возвращает Mono8 (2D numpy array). Без cvtColor."""
         if not self.stream:
             return None
 
@@ -259,8 +251,10 @@ class ArvCameraManager(CameraInterface):
                 except AttributeError:
                     _, _, width, height = buffer.get_image_region()
 
-                img_array = np.frombuffer(data, dtype=np.uint8).reshape((height, width))
-                frame = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                img_array = np.frombuffer(data, dtype=np.uint8).reshape(
+                    (height, width)
+                )
+                frame = img_array
         except Exception as e:
             print(f"Frame conversion error: {e}\n")
             frame = None
@@ -301,13 +295,18 @@ class CameraScanner:
                     device_id = Aravis.get_device_id(idx)
                     camera = Aravis.Camera.new(device_id)
 
-                    model_name = Aravis.get_device_model(idx) if hasattr(Aravis, 'get_device_model') else "GenICam Camera"
+                    model_name = (
+                        Aravis.get_device_model(idx)
+                        if hasattr(Aravis, 'get_device_model')
+                        else "GenICam Camera"
+                    )
                     serial = camera.get_device_serial_number()
 
                     device = camera.get_device()
                     [_, ip, mask, gateway] = device.get_current_ip()
 
-                    print(f"Found Aravis camera: {model_name} (SN: {serial}, IP: {ip.to_string()})\n")
+                    print(f"Found Aravis camera: {model_name} "
+                          f"(SN: {serial}, IP: {ip.to_string()})\n")
 
                     cameras.append({
                         'name': f"{model_name} [{idx}]",
@@ -319,7 +318,8 @@ class CameraScanner:
                         '_saved_ip': ip.to_string()
                     })
                 except Exception as e:
-                    print(f"Error reading Aravis camera info at index {idx}: {e}\n")
+                    print(f"Error reading Aravis camera info "
+                          f"at index {idx}: {e}\n")
 
         except Exception as e:
             print(f"Error scanning Aravis cameras: {e}\n")
