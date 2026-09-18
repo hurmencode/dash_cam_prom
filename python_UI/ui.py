@@ -1,5 +1,4 @@
 import re
-
 import cv2
 from datetime import datetime
 import os
@@ -18,6 +17,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from backend.camera_manager import CameraScanner, create_camera, VideoRecorder
 
 
+# Порог свободного места (МБ)
+MIN_FREE_MB = 500
+
+
 class CameraDiscoveryApp:
     def __init__(self, root):
         self.root = root
@@ -31,7 +34,7 @@ class CameraDiscoveryApp:
 
         self.root.geometry("1300x700")
 
-        # Переменные
+        # Состояние
         self.cameras = []
         self.selected_camera = None
         self.current_camera = None
@@ -61,7 +64,6 @@ class CameraDiscoveryApp:
         self.is_recording = False
         self.current_record_path = None
         self.recording_start_time = None
-        self.recording_duration = 0
 
         # Канвас
         self.canvas_image_id = None
@@ -133,7 +135,8 @@ class CameraDiscoveryApp:
         self.show_video_btn.pack(side=tk.LEFT, padx=5)
 
         self.refresh_btn = ttk.Button(
-            top_frame, text="Обновить статус", command=self.refresh_status, width=20
+            top_frame, text="Обновить статус",
+            command=self.refresh_status, width=20
         )
         self.refresh_btn.pack(side=tk.LEFT, padx=5)
 
@@ -165,7 +168,8 @@ class CameraDiscoveryApp:
                                   command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
 
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=10)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                       padx=(10, 0), pady=10)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=10)
 
         self.tree.bind('<<TreeviewSelect>>', self.on_select_camera)
@@ -192,29 +196,37 @@ class CameraDiscoveryApp:
         )
         self.recording_label.pack(side=tk.LEFT, padx=20)
 
+        self.disk_label = ttk.Label(
+            controls_frame, text="Диск: —",
+            font=('Arial', 10, 'bold'), foreground="#555555"
+        )
+        self.disk_label.pack(side=tk.LEFT, padx=20)
+
         self.video_control_btn = ttk.Button(
-            controls_frame, text="Запустить видео", command=self.toggle_video,
-            width=18, state=tk.DISABLED
+            controls_frame, text="Запустить видео",
+            command=self.toggle_video, width=18, state=tk.DISABLED
         )
         self.video_control_btn.pack(side=tk.RIGHT, padx=5)
 
         self.record_btn = ttk.Button(
-            controls_frame, text="Записать", command=self.toggle_recording,
-            width=15, state=tk.DISABLED
+            controls_frame, text="Записать видео",
+            command=self.toggle_recording, width=18, state=tk.DISABLED
         )
         self.record_btn.pack(side=tk.RIGHT, padx=5)
 
         self.snapshot_btn = ttk.Button(
-            controls_frame, text="Снимок", command=self.take_snapshot,
-            width=12, state=tk.DISABLED
+            controls_frame, text="Снимок",
+            command=self.take_snapshot, width=15, state=tk.DISABLED
         )
         self.snapshot_btn.pack(side=tk.RIGHT, padx=5)
 
-        self.video_frame = ttk.Frame(self.video_tab, relief=tk.SUNKEN, borderwidth=2)
+        self.video_frame = ttk.Frame(self.video_tab, relief=tk.SUNKEN,
+                                     borderwidth=2)
         self.video_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.video_canvas = tk.Canvas(self.video_frame, background='black',
-                                      highlightthickness=0)
+        self.video_canvas = tk.Canvas(
+            self.video_frame, background='black', highlightthickness=0
+        )
         self.video_canvas.pack(fill=tk.BOTH, expand=True)
 
         self.video_status = ttk.Label(
@@ -227,13 +239,10 @@ class CameraDiscoveryApp:
         log_controls = ttk.Frame(self.log_tab, padding="5")
         log_controls.pack(fill=tk.X)
 
-        clear_log_btn = ttk.Button(log_controls, text="Очистить логи",
-                                   command=self.clear_logs)
-        clear_log_btn.pack(side=tk.LEFT, padx=5)
-
-        save_log_btn = ttk.Button(log_controls, text="Сохранить логи",
-                                  command=self.save_logs)
-        save_log_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(log_controls, text="Очистить логи",
+                   command=self.clear_logs).pack(side=tk.LEFT, padx=5)
+        ttk.Button(log_controls, text="Сохранить логи",
+                   command=self.save_logs).pack(side=tk.LEFT, padx=5)
 
         log_frame = ttk.Frame(self.log_tab)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -256,7 +265,7 @@ class CameraDiscoveryApp:
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.log_info("Логи запущены. Приложение готово к работе.")
+        self.log_info("Логи запущены.")
         self.log_info("Нажмите 'Поиск камер' для сканирования.")
 
     # ============ ЛОГИ ============
@@ -287,9 +296,9 @@ class CameraDiscoveryApp:
     def save_logs(self):
         file_path = filedialog.asksaveasfilename(
             defaultextension=".log",
-            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"),
-                       ("All files", "*.*")],
-            title="Сохранить логи"
+            filetypes=[("Log files", "*.log"),
+                       ("Text files", "*.txt"),
+                       ("All files", "*.*")]
         )
         if file_path:
             try:
@@ -303,10 +312,11 @@ class CameraDiscoveryApp:
     def create_context_menu(self):
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="Копировать IP", command=self.copy_ip)
-        self.context_menu.add_command(label="Копировать серийный номер",
+        self.context_menu.add_command(label="Копировать SN",
                                       command=self.copy_serial)
         self.context_menu.add_separator()
-        self.context_menu.add_command(label="Обновить", command=self.scan_cameras)
+        self.context_menu.add_command(label="Обновить",
+                                      command=self.scan_cameras)
         self.tree.bind('<Button-3>', self.show_context_menu)
 
     def show_context_menu(self, event):
@@ -325,7 +335,6 @@ class CameraDiscoveryApp:
                     self.root.clipboard_clear()
                     self.root.clipboard_append(ip)
                     self.status_bar.config(text=f"Скопирован IP: {ip}")
-                    self.log_success(f"IP адрес скопирован: {ip}")
 
     def copy_serial(self):
         selection = self.tree.selection()
@@ -336,14 +345,12 @@ class CameraDiscoveryApp:
                 if serial and serial not in ('N/A', 'Unknown'):
                     self.root.clipboard_clear()
                     self.root.clipboard_append(serial)
-                    self.status_bar.config(text=f"Скопирован серийный номер: {serial}")
-                    self.log_success(f"Серийный номер скопирован: {serial}")
+                    self.status_bar.config(text=f"Скопирован SN: {serial}")
 
     def get_type_display(self, camera_type: str) -> str:
         type_map = {
-            'webcam': 'USB',
-            'gige': 'GigE',
             'aravis': 'GigE',
+            'gige': 'GigE',
             'unknown': 'Unknown'
         }
         return type_map.get(camera_type, camera_type.upper())
@@ -354,8 +361,7 @@ class CameraDiscoveryApp:
         self.loading_label.config(text="Поиск камер...")
         self.status_bar.config(text="Выполняется сканирование камер...")
 
-        thread = Thread(target=self._scan_cameras_thread, daemon=True)
-        thread.start()
+        Thread(target=self._scan_cameras_thread, daemon=True).start()
 
     def _scan_cameras_thread(self):
         try:
@@ -374,20 +380,18 @@ class CameraDiscoveryApp:
             self.tree.delete(item)
 
         if not self.cameras:
-            self.tree.insert('', 'end', values=('Нет камер', '—', '—', '—', '—'))
+            self.tree.insert('', 'end',
+                             values=('Нет камер', '—', '—', '—', '—'))
             self.status_bar.config(text="Камеры не найдены")
             self.log_warning("Камеры не найдены")
         else:
             for cam in self.cameras:
                 status = cam.get('status', 'Unknown')
-                if status == 'Available':
-                    status_display = 'Доступна'
-                elif status == 'Connected':
-                    status_display = 'Подключена'
-                elif status == 'Failed':
-                    status_display = 'Ошибка'
-                else:
-                    status_display = 'Неизвестно'
+                status_display = {
+                    'Available': 'Доступна',
+                    'Connected': 'Подключена',
+                    'Failed': 'Ошибка'
+                }.get(status, 'Неизвестно')
 
                 ip = cam.get('ip', 'N/A') or 'N/A'
                 camera_type = cam.get('type', 'unknown')
@@ -395,24 +399,17 @@ class CameraDiscoveryApp:
 
                 self.tree.insert(
                     '', 'end',
-                    values=(
-                        cam.get('name', 'Unknown'),
-                        type_display,
-                        cam.get('serial', 'N/A'),
-                        ip,
-                        status_display
-                    ),
+                    values=(cam.get('name', 'Unknown'),
+                            type_display,
+                            cam.get('serial', 'N/A'),
+                            ip,
+                            status_display),
                     tags=(camera_type,)
                 )
 
-            aravis_count = sum(1 for c in self.cameras
-                               if c.get('type') in ('aravis', 'gige'))
-            status_text = f"Найдено камер: {len(self.cameras)}"
-            if aravis_count > 0:
-                status_text += f" (GigE: {aravis_count})"
-
-            self.status_bar.config(text=status_text)
-            self.log_info(f"Отображено камер в таблице: {len(self.cameras)}")
+            self.status_bar.config(
+                text=f"Найдено камер: {len(self.cameras)}"
+            )
 
         self.scan_btn.config(state=tk.NORMAL)
         self.loading_label.config(text="")
@@ -422,7 +419,6 @@ class CameraDiscoveryApp:
         selection = self.tree.selection()
         if selection:
             selected_index = self.tree.index(selection[0])
-
             if selected_index < len(self.cameras):
                 self.selected_camera = self.cameras[selected_index]
                 self.connect_btn.config(state=tk.NORMAL)
@@ -437,24 +433,34 @@ class CameraDiscoveryApp:
                     text=f"Выбрана: {name} | Тип: {type_display} "
                          f"| SN: {serial} | IP: {ip}"
                 )
-                self.log_info(
-                    f"Выбрана камера: {name} "
-                    f"(Тип: {type_display}, SN: {serial})"
-                )
             else:
                 self.connect_btn.config(state=tk.DISABLED)
 
     def connect_camera(self):
         if not self.selected_camera:
-            messagebox.showwarning("Предупреждение", "Сначала выберите камеру")
+            messagebox.showwarning("Предупреждение",
+                                "Сначала выберите камеру")
             return
 
+        # ============ ОСВОБОЖДАЕМ ПРЕДЫДУЩУЮ КАМЕРУ ============
+        # Если уже подключена другая камера — сначала корректно её
+        # освобождаем, иначе обе будут делить один гигабитный линк
+        # и потери пакетов неизбежны.
         self.stop_video_stream()
         if self.is_recording:
             self.stop_recording()
+        if self.current_camera is not None:
+            try:
+                self.log_info("Освобождаю предыдущую камеру...")
+                self.current_camera.release()
+            except Exception as e:
+                self.log_error(f"Ошибка освобождения камеры: {e}")
+            finally:
+                self.current_camera = None
+        # ======================================================
 
         camera_name = self.selected_camera.get('name', 'Unknown')
-        camera_type = self.selected_camera.get('type', 'webcam')
+        camera_type = self.selected_camera.get('type', 'aravis')
         device_id = self.selected_camera.get('device_id', 0)
         ip = self.selected_camera.get('ip', 'N/A')
         saved_ip = self.selected_camera.get('_saved_ip', None)
@@ -478,10 +484,10 @@ class CameraDiscoveryApp:
             self._update_camera_status(camera_name, 'Connected')
 
             type_display = self.get_type_display(camera_type)
-            info_msg = f"Подключено к камере: {camera_name}\n"
-            info_msg += f"Тип: {type_display}\n"
-            info_msg += (f"Серийный номер: "
-                         f"{self.selected_camera.get('serial', 'N/A')}\n")
+            info_msg = (f"Подключено к камере: {camera_name}\n"
+                        f"Тип: {type_display}\n"
+                        f"Серийный номер: "
+                        f"{self.selected_camera.get('serial', 'N/A')}\n")
             if ip not in ('N/A', 'Unknown'):
                 info_msg += f"IP-адрес: {ip}"
 
@@ -516,10 +522,9 @@ class CameraDiscoveryApp:
             values = self.tree.item(item, 'values')
             if values and values[0] == camera_name:
                 new_values = list(values)
-                if new_status == 'Connected':
-                    new_values[4] = 'Подключена'
-                elif new_status == 'Available':
-                    new_values[4] = 'Доступна'
+                new_values[4] = ('Подключена'
+                                 if new_status == 'Connected'
+                                 else 'Доступна')
                 self.tree.item(item, values=tuple(new_values))
                 break
 
@@ -543,7 +548,8 @@ class CameraDiscoveryApp:
 
     def start_video_stream(self):
         if not self.current_camera:
-            messagebox.showwarning("Предупреждение", "Сначала подключитесь к камере")
+            messagebox.showwarning("Предупреждение",
+                                   "Сначала подключитесь к камере")
             return
         if self.is_streaming:
             return
@@ -591,14 +597,13 @@ class CameraDiscoveryApp:
             self.log_info("Видео поток остановлен")
 
     def _capture_loop(self):
-        """Фоновый поток захвата. Не трогает Tkinter."""
+        """Фоновый поток захвата. Tkinter не трогает."""
         while self.is_streaming and self.current_camera:
             try:
                 frame = self.current_camera.get_frame()
                 if frame is None:
                     continue
 
-                # Размер кадра
                 if self._frame_size is None:
                     self._frame_size = (frame.shape[1], frame.shape[0])
 
@@ -612,11 +617,11 @@ class CameraDiscoveryApp:
                     self.frame_count = 0
                     self.fps_start_time = now
 
-                # Запись (Mono8, isColor=False)
+                # Запись — Mono8 идёт в writer напрямую
                 if self.is_recording and self.video_recorder:
                     self.video_recorder.write_frame(frame)
 
-                # Отображение: Mono8 -> BGR только для показа
+                # Отображение — только если включено
                 if self.display_enabled:
                     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
@@ -625,7 +630,8 @@ class CameraDiscoveryApp:
                     if w > max_w or h > max_h:
                         s = min(max_w / w, max_h / h)
                         display = cv2.resize(
-                            frame_bgr, (int(w * s), int(h * s)),
+                            frame_bgr,
+                            (int(w * s), int(h * s)),
                             interpolation=cv2.INTER_AREA
                         )
                     else:
@@ -637,19 +643,20 @@ class CameraDiscoveryApp:
 
                     if self.is_recording and self.recording_start_time:
                         e = time.time() - self.recording_start_time
-                        hh, mm, ss = (int(e // 3600),
-                                      int((e % 3600) // 60),
-                                      int(e % 60))
-                        tstr = (f"{hh:02d}:{mm:02d}:{ss:02d}"
-                                if hh else f"{mm:02d}:{ss:02d}")
-                        cv2.putText(display, tstr, (dw - 140, 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, font_scale,
-                                    (0, 255, 0), thickness, cv2.LINE_AA)
+                        mm = int((e % 3600) // 60)
+                        ss = int(e % 60)
+                        tstr = f"REC {mm:02d}:{ss:02d}"
+                        cv2.putText(
+                            display, tstr, (dw - 160, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                            (0, 0, 255), thickness, cv2.LINE_AA
+                        )
 
-                    cv2.putText(display, f"FPS: {self.current_fps:.1f}",
-                                (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, font_scale,
-                                (0, 255, 255), thickness, cv2.LINE_AA)
+                    cv2.putText(
+                        display, f"FPS: {self.current_fps:.1f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                        (0, 255, 255), thickness, cv2.LINE_AA
+                    )
 
                     with self.frame_lock:
                         self.last_frame_bgr = display
@@ -687,37 +694,98 @@ class CameraDiscoveryApp:
                         x, y, anchor=tk.NW, image=imgtk
                     )
                     self.video_canvas.image = imgtk
-
                     self.video_status.config(text="Статус: Видео идет")
 
             if self.is_streaming:
                 self.fps_label.config(text=f"FPS: {self.current_fps:.1f}")
 
+            if self.is_streaming and (time.time() % 2 < 0.05):
+                free_mb = self._free_mb(self._current_record_dir())
+                self._update_disk_label(free_mb)
+
         except Exception as e:
             print(f"UI loop error: {e}")
 
-        self.root.after(66, self.update_ui_loop)
+        self.root.after(30, self.update_ui_loop)
 
     # ============ ЗАПИСЬ ============
-    def save_video(self):
-        return filedialog.askdirectory()
-
     def toggle_recording(self):
         if self.is_recording:
             self.stop_recording()
         else:
             self.start_recording()
 
+    def _current_record_dir(self):
+        if self.video_recorder and self.video_recorder.output_dir:
+            return self.video_recorder.output_dir
+        return os.path.expanduser("~")
+
+    def _free_mb(self, path):
+        try:
+            st = os.statvfs(path)
+            return (st.f_bavail * st.f_frsize) / (1024 * 1024)
+        except Exception:
+            return float('inf')
+
+    def _update_disk_label(self, free_mb):
+        if free_mb == float('inf'):
+            self.disk_label.config(text="Диск: —", foreground="#555555")
+            return
+        if free_mb < MIN_FREE_MB:
+            self.disk_label.config(
+                text=f"Диск: {free_mb:.0f} MB (мало!)",
+                foreground="#ff0000"
+            )
+        elif free_mb < MIN_FREE_MB * 3:
+            self.disk_label.config(
+                text=f"Диск: {free_mb:.0f} MB",
+                foreground="#ff8800"
+            )
+        else:
+            self.disk_label.config(
+                text=f"Диск: {free_mb:.0f} MB",
+                foreground="#007700"
+            )
+
+    def _on_disk_full(self, free_mb):
+        self.root.after(0, lambda: self._handle_disk_full(free_mb))
+
+    def _handle_disk_full(self, free_mb):
+        if not self.is_recording:
+            return
+        self.log_error(
+            f"Мало места на диске ({free_mb:.0f} MB). "
+            f"Запись остановлена автоматически."
+        )
+        self.stop_recording()
+        messagebox.showwarning(
+            "Диск заполнен",
+            f"Свободное место меньше {MIN_FREE_MB} MB.\n"
+            f"Запись автоматически остановлена."
+        )
+
     def start_recording(self):
         if not self.current_camera:
-            messagebox.showwarning("Предупреждение", "Сначала подключитесь к камере")
+            messagebox.showwarning("Предупреждение",
+                                   "Сначала подключитесь к камере")
             return
         if self.is_recording:
             return
 
         try:
-            recordings_dir = self.save_video()
+            recordings_dir = filedialog.askdirectory(
+                title="Укажите директорию для сохранения видеофайла"
+            )
             if not recordings_dir:
+                return
+
+            free_mb = self._free_mb(recordings_dir)
+            if free_mb < MIN_FREE_MB:
+                messagebox.showerror(
+                    "Мало места на диске",
+                    f"Свободно всего {free_mb:.0f} MB.\n"
+                    f"Освободите минимум {MIN_FREE_MB} MB и попробуйте снова."
+                )
                 return
 
             camera_info = self.current_camera.get_info()
@@ -734,7 +802,6 @@ class CameraDiscoveryApp:
                 pass
             self.log_info("Отображение отключено на время записи")
 
-            # Если захват не идёт — запускаем без показа
             if not self.is_streaming:
                 self.is_streaming = True
                 self._frame_size = None
@@ -744,12 +811,13 @@ class CameraDiscoveryApp:
                 with self.frame_lock:
                     self.last_frame_bgr = None
                     self.frame_ready = False
-                self.video_thread = Thread(target=self._capture_loop, daemon=True)
+                self.video_thread = Thread(
+                    target=self._capture_loop, daemon=True
+                )
                 self.video_thread.start()
                 self.video_control_btn.config(text="Остановить видео")
                 self.log_info("Захват запущен (без отображения)")
 
-            # Ждём появления размера кадра
             self.video_status.config(text="Статус: Инициализация записи...")
             self.root.update_idletasks()
 
@@ -765,16 +833,18 @@ class CameraDiscoveryApp:
             width, height = self._frame_size
             self.log_info(f"Разрешение кадра: {width}x{height}")
 
-            # FPS: измеренный, БЕЗ округления
             target_fps = int(self.current_fps) if self.current_fps >= 5 else 30
             self.log_info(
-                f"FPS записи: {target_fps} (измеренный {self.current_fps:.1f})"
+                f"FPS записи: {target_fps} "
+                f"(измеренный {self.current_fps:.1f})"
             )
 
             self.video_recorder = VideoRecorder(
                 output_dir=recordings_dir,
                 fps=target_fps,
-                is_color=False   # Mono8
+                is_color=False,
+                min_free_mb=MIN_FREE_MB,
+                on_disk_full=self._on_disk_full
             )
 
             self.current_record_path = self.video_recorder.start_recording(
@@ -782,18 +852,23 @@ class CameraDiscoveryApp:
             )
 
             self.recording_start_time = time.time()
-            self.recording_duration = 0
             self.is_recording = True
             self.record_btn.config(text="Остановить запись")
-            self.recording_label.config(text="Запись: ИДЕТ", foreground='#ff0000')
-            self.log_success(f"Запись начата: {self.current_record_path}")
+            self.recording_label.config(
+                text="Запись: ИДЕТ", foreground='#ff0000'
+            )
+            self.log_success(
+                f"Запись начата: {self.current_record_path}"
+            )
             self.video_status.config(
                 text="Статус: Запись идет (отображение выкл.)"
             )
 
         except Exception as e:
             self.log_error(f"Ошибка начала записи: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось начать запись: {e}")
+            messagebox.showerror(
+                "Ошибка", f"Не удалось начать запись: {e}"
+            )
 
     def stop_recording(self):
         if not self.is_recording or not self.video_recorder:
@@ -802,12 +877,12 @@ class CameraDiscoveryApp:
             saved_path = self.video_recorder.stop_recording()
             self.is_recording = False
             self.recording_start_time = None
-            self.recording_duration = 0
             self.video_recorder = None
-            self.record_btn.config(text="Записать")
-            self.recording_label.config(text="Запись: Нет", foreground="#3010c2")
+            self.record_btn.config(text="Записать видео")
+            self.recording_label.config(
+                text="Запись: Нет", foreground="#3010c2"
+            )
 
-            # Возвращаем отображение, если пользователь его включал
             if self.user_wants_display and self.is_streaming:
                 self.display_enabled = True
                 self.log_info("Отображение снова включено")
@@ -822,7 +897,8 @@ class CameraDiscoveryApp:
                 )
                 if messagebox.askyesno(
                     "Запись завершена",
-                    f"Видео сохранено в:\n{saved_path}\n\nОткрыть папку?"
+                    f"Видео сохранено в:\n{saved_path}\n\n"
+                    f"Открыть папку?"
                 ):
                     dir_path = os.path.dirname(saved_path)
                     if platform.system() == 'Windows':
@@ -833,45 +909,48 @@ class CameraDiscoveryApp:
                         subprocess.Popen(['xdg-open', dir_path])
             else:
                 self.log_warning("Запись не была сохранена")
-                self.video_status.config(text="Статус: Запись не сохранена")
-
+                self.video_status.config(
+                    text="Статус: Запись не сохранена"
+                )
         except Exception as e:
             self.log_error(f"Ошибка остановки записи: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось остановить запись: {e}")
+            messagebox.showerror(
+                "Ошибка", f"Не удалось остановить запись: {e}"
+            )
             self.is_recording = False
             self.recording_start_time = None
             self.video_recorder = None
-            self.record_btn.config(text="Записать")
+            self.record_btn.config(text="Записать видео")
             self.recording_label.config(
                 text="Запись: Нет", foreground="#3010c2"
             )
 
     # ============ СНИМОК ============
-    def save_snapshot(self):
-        return filedialog.askdirectory()
-
     def take_snapshot(self):
-        if not self.current_camera:
-            messagebox.showwarning("Предупреждение", "Камера не подключена")
+        if not self.is_streaming or not self.current_camera:
+            messagebox.showwarning("Предупреждение", "Видео не запущено")
             return
         try:
             frame = self.current_camera.get_frame()
             if frame is None:
                 self.log_warning("Не удалось получить кадр для снимка")
-                messagebox.showwarning("Предупреждение", "Не удалось получить кадр")
                 return
 
-            snapshots_dir = self.save_snapshot()
+            snapshots_dir = filedialog.askdirectory(
+                title="Выберите каталог для сохранения снимка"
+            )
             if not snapshots_dir:
                 return
 
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            camera_name = self.current_camera.get_info().get('name', 'camera')
+            camera_name = self.current_camera.get_info().get(
+                'name', 'camera'
+            )
             safe_name = re.sub(r'[^\w\-_\. ]', '_', camera_name)
-            filename = f"{safe_name}_{timestamp}.png"
-            filepath = os.path.join(snapshots_dir, filename)
+            filepath = os.path.join(
+                snapshots_dir, f"{safe_name}_{timestamp}.png"
+            )
 
-            # Mono8 PNG
             cv2.imwrite(filepath, frame)
             self.log_success(f"Снимок сохранен: {filepath}")
 
@@ -887,7 +966,6 @@ class CameraDiscoveryApp:
                     subprocess.Popen(['xdg-open', snapshots_dir])
         except Exception as e:
             self.log_error(f"Ошибка при сохранении снимка: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось сохранить снимок: {e}")
 
     def _show_error(self, error_message):
         self.scan_btn.config(state=tk.NORMAL)

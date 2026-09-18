@@ -28,91 +28,74 @@ class CameraInterface(ABC):
         pass
 
 
-# ============ ВИДЕОРЕКОРДЕР (GStreamer x264enc, fallback MJPG) ============
+# ============ ВИДЕОРЕКОРДЕР (OpenCV MJPG, Mono8, защита от заполнения диска) ============
 class VideoRecorder:
     """
-    Рекордер на GStreamer + x264enc (программный кодек).
-    GStreamer сам управляет PTS — нет segfault'ов при закрытии.
-    Fallback на MJPG, если GStreamer не собран в OpenCV.
+    OpenCV MJPG (isColor=False для Mono8).
+    Каждый кадр независим — нет PTS-конфликтов, нет segfault'ов.
+    Есть защита от заполнения диска: при свободном месте ниже
+    min_free_mb запись останавливается, вызывается on_disk_full.
     """
 
     def __init__(self, output_dir: str = "recordings", fps: int = 30,
-                 is_color: bool = False):
+                 is_color: bool = False,
+                 min_free_mb: int = 500,
+                 on_disk_full=None):
         self.output_dir = output_dir
         self.fps = max(1, int(fps))
         self.is_color = is_color
+        self.min_free_mb = int(min_free_mb)
+        self.on_disk_full = on_disk_full
+
         self.writer = None
         self.is_recording = False
         self.record_path = None
         self.recording_start_time = None
         self.frame_count = 0
-        self.codec = None
+
+        self._last_disk_check = 0.0
+        self._disk_check_interval = 1.0
+        self._disk_full_triggered = False
 
         os.makedirs(output_dir, exist_ok=True)
-
-    def _build_gst_pipeline(self, width, height, path):
-        fmt = "BGR" if self.is_color else "GRAY8"
-        return (
-            f"appsrc ! video/x-raw,format={fmt} ! "
-            f"videoconvert ! video/x-raw,format=I420 ! "
-            f"x264enc speed-preset=ultrafast tune=zerolatency "
-            f"key-int-max=30 bitrate=5000 ! "
-            f"h264parse ! mp4mux ! filesink location={path}"
-        )
 
     def start_recording(self, width: int, height: int,
                         camera_name: str = "camera") -> str:
         if self.is_recording:
             return self.record_path
 
+        free_mb = self._free_mb()
+        if free_mb < self.min_free_mb:
+            raise RuntimeError(
+                f"Мало места на диске: {free_mb:.0f} MB "
+                f"(нужно минимум {self.min_free_mb} MB)\n"
+            )
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = re.sub(r'[^\w\-_\. ]', '_', camera_name)
+        filename = f"{safe_name}_{timestamp}_mjpg.avi"
+        self.record_path = os.path.join(self.output_dir, filename)
 
-        # Пробуем GStreamer + x264enc
-        mp4_path = os.path.join(self.output_dir,
-                                f"{safe_name}_{timestamp}.mp4")
-        pipeline = self._build_gst_pipeline(width, height, mp4_path)
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        self.writer = cv2.VideoWriter(
+            self.record_path, fourcc, self.fps,
+            (width, height), isColor=self.is_color
+        )
 
-        try:
-            self.writer = cv2.VideoWriter(
-                pipeline, cv2.CAP_GSTREAMER, 0, self.fps,
-                (width, height), isColor=self.is_color
+        if not self.writer.isOpened():
+            raise RuntimeError(
+                f"Failed to create MJPG writer: {self.record_path}\n"
             )
-            if self.writer.isOpened():
-                self.record_path = mp4_path
-                self.codec = "x264enc (GStreamer)"
-            else:
-                self.writer = None
-        except Exception as e:
-            print(f"GStreamer pipeline error: {e}\n")
-            self.writer = None
-
-        # Fallback на MJPG
-        if self.writer is None:
-            print("GStreamer недоступен, fallback на MJPG\n")
-            avi_path = os.path.join(self.output_dir,
-                                    f"{safe_name}_{timestamp}_mjpg.avi")
-            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            self.writer = cv2.VideoWriter(
-                avi_path, fourcc, self.fps,
-                (width, height), isColor=self.is_color
-            )
-            if self.writer.isOpened():
-                self.record_path = avi_path
-                self.codec = "MJPG"
-            else:
-                self.writer = None
-
-        if self.writer is None or not self.writer.isOpened():
-            raise RuntimeError("Не удалось создать VideoWriter (ни GStreamer, ни MJPG)\n")
 
         self.is_recording = True
         self.recording_start_time = time.time()
         self.frame_count = 0
+        self._last_disk_check = 0.0
+        self._disk_full_triggered = False
 
-        print(f"Запись начата: {self.record_path}\n")
-        print(f"   Кодек: {self.codec}, "
-              f"{width}x{height}, isColor={self.is_color}, fps={self.fps}\n")
+        print(f"Запись начата (MJPG): {self.record_path}\n")
+        print(f"   {width}x{height}, isColor={self.is_color}, "
+              f"fps={self.fps}, min_free={self.min_free_mb} MB\n")
         return self.record_path
 
     def write_frame(self, frame: np.ndarray) -> bool:
@@ -120,6 +103,25 @@ class VideoRecorder:
             return False
         if frame is None:
             return False
+
+        now = time.time()
+        if now - self._last_disk_check >= self._disk_check_interval:
+            self._last_disk_check = now
+            free_mb = self._free_mb()
+            if free_mb < self.min_free_mb:
+                if not self._disk_full_triggered:
+                    self._disk_full_triggered = True
+                    print(f"!!! Мало места на диске "
+                          f"({free_mb:.0f} MB < {self.min_free_mb} MB). "
+                          f"Останавливаю запись.\n")
+                    self.is_recording = False
+                    if self.on_disk_full is not None:
+                        try:
+                            self.on_disk_full(free_mb)
+                        except Exception as e:
+                            print(f"on_disk_full callback error: {e}\n")
+                return False
+
         try:
             self.writer.write(frame)
             self.frame_count += 1
@@ -129,19 +131,18 @@ class VideoRecorder:
             return False
 
     def stop_recording(self) -> Optional[str]:
-        if not self.is_recording:
+        if self.writer is None:
             return None
 
         self.is_recording = False
-
-        # Даём GStreamer/OpenCV время дописать буфер
-        time.sleep(0.3)
+        time.sleep(0.2)
 
         if self.writer:
             self.writer.release()
             self.writer = None
 
-            duration = time.time() - self.recording_start_time
+            duration = (time.time() - self.recording_start_time
+                        if self.recording_start_time else 0)
             try:
                 file_size = os.path.getsize(self.record_path) / (1024 * 1024)
             except OSError:
@@ -163,20 +164,30 @@ class VideoRecorder:
                          if self.recording_start_time else 0),
             'fps': self.fps,
             'frame_count': self.frame_count,
-            'codec': self.codec,
-            'is_color': self.is_color
+            'codec': 'MJPG',
+            'is_color': self.is_color,
         }
+
+    def _free_mb(self) -> float:
+        try:
+            st = os.statvfs(self.output_dir)
+            return (st.f_bavail * st.f_frsize) / (1024 * 1024)
+        except Exception as e:
+            print(f"statvfs error: {e}\n")
+            return float('inf')
 
 
 # ============ ARV CAMERA MANAGER (ARAVIS API) ============
 class ArvCameraManager(CameraInterface):
     def __init__(self, pixel_format: str = 'Mono8',
-                 device_index: int = 0, saved_ip: str = None):
+                 device_index: int = 0, saved_ip: str = None,
+                 target_frame_rate: float = None):
         self.camera = None
         self.stream = None
         self.pixel_format = pixel_format
         self.device_index = device_index
         self.saved_ip = saved_ip
+        self.target_frame_rate = target_frame_rate
 
         self._info = {
             'name': 'Unknown GenICam',
@@ -216,14 +227,19 @@ class ArvCameraManager(CameraInterface):
 
             if self.pixel_format:
                 try:
-                    self.camera.set_pixel_format_from_string(self.pixel_format)
+                    self.camera.set_pixel_format_from_string(
+                        self.pixel_format
+                    )
                 except Exception as e:
-                    print(f"Could not set pixel format {self.pixel_format}: {e}\n")
+                    print(f"Could not set pixel format "
+                          f"{self.pixel_format}: {e}\n")
 
             self.stream = self.camera.create_stream(None, None)
             payload = self.camera.get_payload()
             for _ in range(10):
-                self.stream.push_buffer(Aravis.Buffer.new_allocate(payload))
+                self.stream.push_buffer(
+                    Aravis.Buffer.new_allocate(payload)
+                )
 
             self.camera.start_acquisition()
 
@@ -233,7 +249,7 @@ class ArvCameraManager(CameraInterface):
             raise
 
     def get_frame(self) -> Optional[np.ndarray]:
-        """Возвращает Mono8 (2D numpy array). Без cvtColor."""
+        """Mono8 (2D uint8). Без cvtColor — быстро."""
         if not self.stream:
             return None
 
@@ -259,7 +275,10 @@ class ArvCameraManager(CameraInterface):
             print(f"Frame conversion error: {e}\n")
             frame = None
         finally:
-            self.stream.push_buffer(buffer)
+            try:
+                self.stream.push_buffer(buffer)
+            except Exception:
+                pass
 
         return frame
 
@@ -270,6 +289,7 @@ class ArvCameraManager(CameraInterface):
                 self.stream.set_emit_signals(False)
                 self.stream = None
                 self.camera = None
+                print("[INFO] Aravis camera released.")
             except Exception as e:
                 print(f"Error releasing Aravis camera: {e}\n")
 
