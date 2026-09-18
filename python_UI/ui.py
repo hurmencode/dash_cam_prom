@@ -16,6 +16,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from backend.camera_manager import CameraScanner, create_camera, VideoRecorder
 
+# Порог свободного места (МБ) — общий для UI и Recorder
+MIN_FREE_MB = 500
+
 
 class CameraDiscoveryApp:
     def __init__(self, root):
@@ -47,7 +50,7 @@ class CameraDiscoveryApp:
         self.current_fps = 0.0
         self.fps_update_interval = 0.5
 
-        # Буфер кадра (BGR для показа)
+        # Буфер кадра
         self.last_frame_bgr = None
         self.frame_lock = Lock()
         self.frame_ready = False
@@ -195,6 +198,13 @@ class CameraDiscoveryApp:
             font=('Arial', 10, 'bold'), foreground="#3010c2"
         )
         self.recording_label.pack(side=tk.LEFT, padx=20)
+
+        # Индикатор свободного места
+        self.disk_label = ttk.Label(
+            controls_frame, text="Диск: —",
+            font=('Arial', 10, 'bold'), foreground="#555555"
+        )
+        self.disk_label.pack(side=tk.LEFT, padx=20)
 
         self.video_control_btn = ttk.Button(
             controls_frame, text="Запустить видео",
@@ -574,7 +584,6 @@ class CameraDiscoveryApp:
 
                 # Отображение — только если включено
                 if self.display_enabled:
-                    # Mono8 -> BGR только для показа
                     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
                     h, w = frame_bgr.shape[:2]
@@ -651,6 +660,11 @@ class CameraDiscoveryApp:
             if self.is_streaming:
                 self.fps_label.config(text=f"FPS: {self.current_fps:.1f}")
 
+            # Обновляем индикатор диска раз в ~2 секунды
+            if self.is_streaming and (time.time() % 2 < 0.05):
+                free_mb = self._free_mb(self._current_record_dir())
+                self._update_disk_label(free_mb)
+
         except Exception as e:
             print(f"UI loop error: {e}")
 
@@ -662,6 +676,60 @@ class CameraDiscoveryApp:
             self.stop_recording()
         else:
             self.start_recording()
+
+    def _current_record_dir(self):
+        """Директория, куда пишем — для индикации свободного места."""
+        if self.video_recorder and self.video_recorder.output_dir:
+            return self.video_recorder.output_dir
+        return os.path.expanduser("~")
+
+    def _free_mb(self, path):
+        try:
+            st = os.statvfs(path)
+            return (st.f_bavail * st.f_frsize) / (1024 * 1024)
+        except Exception:
+            return float('inf')
+
+    def _update_disk_label(self, free_mb):
+        if free_mb == float('inf'):
+            self.disk_label.config(text="Диск: —", foreground="#555555")
+            return
+        if free_mb < MIN_FREE_MB:
+            self.disk_label.config(
+                text=f"Диск: {free_mb:.0f} MB (мало!)",
+                foreground="#ff0000"
+            )
+        elif free_mb < MIN_FREE_MB * 3:
+            self.disk_label.config(
+                text=f"Диск: {free_mb:.0f} MB",
+                foreground="#ff8800"
+            )
+        else:
+            self.disk_label.config(
+                text=f"Диск: {free_mb:.0f} MB",
+                foreground="#007700"
+            )
+
+    # ---------- Callback от VideoRecorder (в фоновом потоке!) ----------
+    def _on_disk_full(self, free_mb):
+        """Вызывается из фонового потока _capture_loop."""
+        # Перебрасываем в main-поток Tkinter
+        self.root.after(0, lambda: self._handle_disk_full(free_mb))
+
+    def _handle_disk_full(self, free_mb):
+        """Уже в main-потоке. Останавливаем запись корректно."""
+        if not self.is_recording:
+            return
+        self.log_error(
+            f"Мало места на диске ({free_mb:.0f} MB). "
+            f"Запись остановлена автоматически."
+        )
+        self.stop_recording()
+        messagebox.showwarning(
+            "Диск заполнен",
+            f"Свободное место меньше {MIN_FREE_MB} MB.\n"
+            f"Запись автоматически остановлена."
+        )
 
     def start_recording(self):
         if not self.current_camera:
@@ -677,6 +745,16 @@ class CameraDiscoveryApp:
                 title="Укажите директорию для сохранения видеофайла"
             )
             if not recordings_dir:
+                return
+
+            # Проверка места ДО старта
+            free_mb = self._free_mb(recordings_dir)
+            if free_mb < MIN_FREE_MB:
+                messagebox.showerror(
+                    "Мало места на диске",
+                    f"Свободно всего {free_mb:.0f} MB.\n"
+                    f"Освободите минимум {MIN_FREE_MB} MB и попробуйте снова."
+                )
                 return
 
             camera_info = self.current_camera.get_info()
@@ -734,7 +812,9 @@ class CameraDiscoveryApp:
             self.video_recorder = VideoRecorder(
                 output_dir=recordings_dir,
                 fps=target_fps,
-                is_color=False   # Mono8
+                is_color=False,
+                min_free_mb=MIN_FREE_MB,
+                on_disk_full=self._on_disk_full
             )
 
             self.current_record_path = self.video_recorder.start_recording(
@@ -774,7 +854,6 @@ class CameraDiscoveryApp:
                 text="Запись: Нет", foreground="#3010c2"
             )
 
-            # Возвращаем отображение, если пользователь его включал
             if self.user_wants_display and self.is_streaming:
                 self.display_enabled = True
                 self.log_info("Отображение снова включено")

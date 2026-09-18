@@ -23,31 +23,52 @@ class CameraInterface(ABC):
         pass
 
 
-# ============ ВИДЕОРЕКОРДЕР (OpenCV MJPG, Mono8) ============
+# ============ ВИДЕОРЕКОРДЕР (OpenCV MJPG, Mono8, защита от заполнения диска) ============
 class VideoRecorder:
     """
-    Простая и стабильная запись через OpenCV MJPG.
-    Каждый кадр независим (как JPEG) — нет PTS-конфликтов, нет segfault'ов.
-    Работает с Mono8 через isColor=False.
+    Простая и стабильная запись через OpenCV MJPG (isColor=False для Mono8).
+    Каждый кадр независим — нет PTS-конфликтов, нет segfault'ов.
+    Есть защита от заполнения диска: при свободном месте ниже min_free_mb
+    запись останавливается, вызывается on_disk_full (в фоновом потоке —
+    UI должен сам перекинуть обработку в main-поток).
     """
 
     def __init__(self, output_dir: str = "recordings", fps: int = 30,
-                 is_color: bool = False):
+                 is_color: bool = False,
+                 min_free_mb: int = 500,
+                 on_disk_full=None):
         self.output_dir = output_dir
         self.fps = max(1, int(fps))
         self.is_color = is_color
+        self.min_free_mb = int(min_free_mb)
+        self.on_disk_full = on_disk_full
+
         self.writer = None
         self.is_recording = False
         self.record_path = None
         self.recording_start_time = None
         self.frame_count = 0
 
+        # Служебное для проверки диска
+        self._last_disk_check = 0.0
+        self._disk_check_interval = 1.0
+        self._disk_full_triggered = False
+
         os.makedirs(output_dir, exist_ok=True)
 
+    # ---------- Публичные методы ----------
     def start_recording(self, width: int, height: int,
                         camera_name: str = "camera") -> str:
         if self.is_recording:
             return self.record_path
+
+        # Проверка места ДО старта
+        free_mb = self._free_mb()
+        if free_mb < self.min_free_mb:
+            raise RuntimeError(
+                f"Мало места на диске: {free_mb:.0f} MB "
+                f"(нужно минимум {self.min_free_mb} MB)\n"
+            )
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = re.sub(r'[^\w\-_\. ]', '_', camera_name)
@@ -68,10 +89,12 @@ class VideoRecorder:
         self.is_recording = True
         self.recording_start_time = time.time()
         self.frame_count = 0
+        self._last_disk_check = 0.0
+        self._disk_full_triggered = False
 
         print(f"Запись начата (MJPG): {self.record_path}\n")
         print(f"   {width}x{height}, isColor={self.is_color}, "
-              f"fps={self.fps}\n")
+              f"fps={self.fps}, min_free={self.min_free_mb} MB\n")
         return self.record_path
 
     def write_frame(self, frame: np.ndarray) -> bool:
@@ -79,6 +102,27 @@ class VideoRecorder:
             return False
         if frame is None:
             return False
+
+        # --- Проверка свободного места не чаще раза в секунду ---
+        now = time.time()
+        if now - self._last_disk_check >= self._disk_check_interval:
+            self._last_disk_check = now
+            free_mb = self._free_mb()
+            if free_mb < self.min_free_mb:
+                if not self._disk_full_triggered:
+                    self._disk_full_triggered = True
+                    print(f"!!! Мало места на диске "
+                          f"({free_mb:.0f} MB < {self.min_free_mb} MB). "
+                          f"Останавливаю запись.\n")
+                    # Меняем флаг ДО callback'а, чтобы избежать гонок
+                    self.is_recording = False
+                    if self.on_disk_full is not None:
+                        try:
+                            self.on_disk_full(free_mb)
+                        except Exception as e:
+                            print(f"on_disk_full callback error: {e}\n")
+                return False
+
         try:
             self.writer.write(frame)
             self.frame_count += 1
@@ -88,7 +132,7 @@ class VideoRecorder:
             return False
 
     def stop_recording(self) -> Optional[str]:
-        if not self.is_recording:
+        if self.writer is None:
             return None
 
         self.is_recording = False
@@ -98,7 +142,8 @@ class VideoRecorder:
             self.writer.release()
             self.writer = None
 
-            duration = time.time() - self.recording_start_time
+            duration = (time.time() - self.recording_start_time
+                        if self.recording_start_time else 0)
             try:
                 file_size = os.path.getsize(self.record_path) / (1024 * 1024)
             except OSError:
@@ -108,7 +153,9 @@ class VideoRecorder:
             print(f"   Кадров: {self.frame_count}\n")
             print(f"   Длительность: {duration:.1f} сек\n")
             print(f"   Размер видео: {file_size:.2f} MB\n")
+            print(f"   Остановлено по диску: {self._disk_full_triggered}\n")
             return self.record_path
+
         return None
 
     def get_recording_status(self) -> Dict:
@@ -120,8 +167,21 @@ class VideoRecorder:
             'fps': self.fps,
             'frame_count': self.frame_count,
             'codec': 'MJPG',
-            'is_color': self.is_color
+            'is_color': self.is_color,
+            'min_free_mb': self.min_free_mb,
+            'disk_full_triggered': self._disk_full_triggered,
+            'free_mb': self._free_mb()
         }
+
+    # ---------- Служебные ----------
+    def _free_mb(self) -> float:
+        """Свободное место в директории записи, МБ."""
+        try:
+            st = os.statvfs(self.output_dir)
+            return (st.f_bavail * st.f_frsize) / (1024 * 1024)
+        except Exception as e:
+            print(f"statvfs error: {e}\n")
+            return float('inf')
 
 
 # ============ LUCID CAMERA MANAGER (ARENA API) ============
@@ -230,7 +290,6 @@ class LucidCameraManager(CameraInterface):
             img_array = np.ctypeslib.as_array(
                 buffer.pdata, shape=(height, width)
             )
-            # Копируем — буфер будет переиспользован после requeue_buffer
             frame = np.array(img_array)
         except Exception as e:
             print(f"[ERROR] Frame conversion error: {e}\n")
