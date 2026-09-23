@@ -7,6 +7,9 @@ import platform
 import subprocess
 import sys
 import time
+import signal
+import threading
+import traceback
 import tkinter as tk
 from tkinter import PhotoImage, ttk, messagebox, filedialog
 from threading import Thread, Lock
@@ -18,13 +21,15 @@ from backend.camera_manager import CameraScanner, create_camera, VideoRecorder
 
 
 # Порог свободного места (МБ)
-MIN_FREE_MB = 500
+MIN_FREE_MB = 1000
 
 
 class CameraDiscoveryApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Видеорегистратор 3000")
+
+        self._closing = False
 
         try:
             icon = PhotoImage(file="favicon.png")
@@ -33,6 +38,21 @@ class CameraDiscoveryApp:
             print(f"Не удалось загрузить иконку: {e}")
 
         self.root.geometry("1300x700")
+
+        # ============ ФАЙЛ-ДУБЛЁР ЛОГОВ ============
+        log_dir = os.path.join(os.path.expanduser("~"),
+                               "dash_cam_prom", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_file_path = os.path.join(
+            log_dir, f"session_{session_ts}.log"
+        )
+        try:
+            self.log_file = open(self.log_file_path, 'a', encoding='utf-8')
+        except Exception as e:
+            print(f"Не удалось открыть файл логов: {e}")
+            self.log_file = None
+        # ==========================================
 
         # Состояние
         self.cameras = []
@@ -71,6 +91,9 @@ class CameraDiscoveryApp:
         # Интерфейс
         self.create_widgets()
 
+        # Обработчики аварийного завершения
+        self.install_crash_handlers()
+
         # Автопоиск
         self.root.after(500, self.scan_cameras)
 
@@ -80,10 +103,96 @@ class CameraDiscoveryApp:
         # Закрытие
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+        self.log_info(f"Сессия логов: {self.log_file_path}")
+
+    # ============ АВАРИЙНЫЕ ОБРАБОТЧИКИ ============
+    def install_crash_handlers(self):
+        """Ловим необработанные исключения и сигналы ОС,
+        чтобы успеть сохранить логи перед смертью приложения."""
+
+        # 1. Исключения в main-потоке
+        original_hook = sys.excepthook
+
+        def excepthook(exc_type, exc_value, exc_tb):
+            try:
+                self.log_error(
+                    f"НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ: "
+                    f"{exc_type.__name__}: {exc_value}"
+                )
+                tb_text = ''.join(
+                    traceback.format_exception(exc_type, exc_value, exc_tb)
+                )
+                self._log_to_file(tb_text)
+            except Exception:
+                pass
+            finally:
+                self._close_log_file()
+                original_hook(exc_type, exc_value, exc_tb)
+
+        sys.excepthook = excepthook
+
+        # 2. Исключения в фоновых потоках
+        def thread_excepthook(args):
+            try:
+                self.log_error(
+                    f"ИСКЛЮЧЕНИЕ В ПОТОКЕ {args.thread.name}: "
+                    f"{args.exc_type.__name__}: {args.exc_value}"
+                )
+                tb_text = ''.join(
+                    traceback.format_exception(
+                        args.exc_type, args.exc_value, args.exc_traceback
+                    )
+                )
+                self._log_to_file(tb_text)
+            except Exception:
+                pass
+
+        threading.excepthook = thread_excepthook
+
+        # 3. Ctrl+C (SIGINT) и SIGTERM
+        def signal_handler(signum, frame):
+            try:
+                self.log_warning(
+                    f"Получен сигнал {signum}, завершаю работу..."
+                )
+            except Exception:
+                pass
+            try:
+                self.root.after(0, self.on_closing)
+            except Exception:
+                pass
+
+        try:
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+        except Exception as e:
+            print(f"Не удалось установить обработчики сигналов: {e}")
+
+    def _log_to_file(self, message):
+        if self.log_file is not None:
+            try:
+                self.log_file.write(message + "\n")
+                self.log_file.flush()
+            except Exception:
+                pass
+
+    def _close_log_file(self):
+        if getattr(self, 'log_file', None) is not None:
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
+            self.log_file = None
+
     # ============ ЗАКРЫТИЕ ============
     def on_closing(self):
+        if self._closing:
+            return
+        self._closing = True
+
         self.is_streaming = False
         self.display_enabled = False
+
         try:
             if self.is_recording:
                 self.stop_recording()
@@ -94,7 +203,19 @@ class CameraDiscoveryApp:
                 self.current_camera.release()
         except Exception:
             pass
-        self.root.destroy()
+
+        try:
+            if self.log_file is not None:
+                self.log_info("Приложение завершает работу, "
+                              "логи сохранены.")
+                self._close_log_file()
+        except Exception:
+            pass
+
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     # ============ ИНТЕРФЕЙС ============
     def create_widgets(self):
@@ -265,29 +386,46 @@ class CameraDiscoveryApp:
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.log_info("Логи запущены.")
-        self.log_info("Нажмите 'Поиск камер' для сканирования.")
-
     # ============ ЛОГИ ============
     def log_info(self, message):
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n", ('blue',))
-        self.log_text.see(tk.END)
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f"[{timestamp}] {message}"
+        try:
+            self.log_text.insert(tk.END, line + "\n", ('blue',))
+            self.log_text.see(tk.END)
+        except Exception:
+            pass
+        self._log_to_file(line)
 
     def log_success(self, message):
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n", ('green',))
-        self.log_text.see(tk.END)
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f"[{timestamp}] {message}"
+        try:
+            self.log_text.insert(tk.END, line + "\n", ('green',))
+            self.log_text.see(tk.END)
+        except Exception:
+            pass
+        self._log_to_file(line)
 
     def log_warning(self, message):
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n", ('orange',))
-        self.log_text.see(tk.END)
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f"[{timestamp}] [WARN] {message}"
+        try:
+            self.log_text.insert(tk.END, line + "\n", ('orange',))
+            self.log_text.see(tk.END)
+        except Exception:
+            pass
+        self._log_to_file(line)
 
     def log_error(self, message):
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n", ('red',))
-        self.log_text.see(tk.END)
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f"[{timestamp}] [ERROR] {message}"
+        try:
+            self.log_text.insert(tk.END, line + "\n", ('red',))
+            self.log_text.see(tk.END)
+        except Exception:
+            pass
+        self._log_to_file(line)
 
     def clear_logs(self):
         self.log_text.delete(1.0, tk.END)
@@ -439,13 +577,10 @@ class CameraDiscoveryApp:
     def connect_camera(self):
         if not self.selected_camera:
             messagebox.showwarning("Предупреждение",
-                                "Сначала выберите камеру")
+                                   "Сначала выберите камеру")
             return
 
-        # ============ ОСВОБОЖДАЕМ ПРЕДЫДУЩУЮ КАМЕРУ ============
-        # Если уже подключена другая камера — сначала корректно её
-        # освобождаем, иначе обе будут делить один гигабитный линк
-        # и потери пакетов неизбежны.
+        # Освобождаем предыдущую камеру
         self.stop_video_stream()
         if self.is_recording:
             self.stop_recording()
@@ -457,7 +592,6 @@ class CameraDiscoveryApp:
                 self.log_error(f"Ошибка освобождения камеры: {e}")
             finally:
                 self.current_camera = None
-        # ======================================================
 
         camera_name = self.selected_camera.get('name', 'Unknown')
         camera_type = self.selected_camera.get('type', 'aravis')
@@ -664,7 +798,7 @@ class CameraDiscoveryApp:
 
             except Exception as e:
                 if self.is_streaming:
-                    print(f"Ошибка захвата: {e}")
+                    self.log_error(f"Ошибка захвата: {e}")
                 break
 
     def update_ui_loop(self):
@@ -706,7 +840,8 @@ class CameraDiscoveryApp:
         except Exception as e:
             print(f"UI loop error: {e}")
 
-        self.root.after(30, self.update_ui_loop)
+        if not self._closing:
+            self.root.after(30, self.update_ui_loop)
 
     # ============ ЗАПИСЬ ============
     def toggle_recording(self):
@@ -791,7 +926,6 @@ class CameraDiscoveryApp:
             camera_info = self.current_camera.get_info()
             camera_name = camera_info.get('name', 'camera')
 
-            # Гасим отображение на время записи
             self.display_enabled = False
             if self.canvas_image_id:
                 self.video_canvas.delete(self.canvas_image_id)
@@ -977,7 +1111,17 @@ class CameraDiscoveryApp:
 def main():
     root = tk.Tk()
     app = CameraDiscoveryApp(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        app.log_warning("Прервано пользователем (Ctrl+C)")
+        app.on_closing()
+    except Exception as e:
+        app.log_error(f"Критическая ошибка в mainloop: {e}")
+        app._log_to_file(traceback.format_exc())
+        app.on_closing()
+    finally:
+        app._close_log_file()
 
 
 if __name__ == "__main__":

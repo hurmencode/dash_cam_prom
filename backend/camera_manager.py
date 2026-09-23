@@ -12,6 +12,7 @@ import gi
 gi.require_version('Aravis', '0.10')
 from gi.repository import Aravis
 
+cv2.setNumThreads(2)
 
 # ============ БАЗОВЫЙ ИНТЕРФЕЙС ============
 class CameraInterface(ABC):
@@ -235,8 +236,14 @@ class ArvCameraManager(CameraInterface):
                           f"{self.pixel_format}: {e}\n")
 
             self.stream = self.camera.create_stream(None, None)
+            try:
+                self.stream.set_property("packet-timeout", 50000)
+                self.stream.set_property("initial-packet-timeout", 5000)
+            except Exception as e:
+                print(f"[WARN] Could not set stream timeouts: {e}\n")
+
             payload = self.camera.get_payload()
-            for _ in range(10):
+            for _ in range(20):
                 self.stream.push_buffer(
                     Aravis.Buffer.new_allocate(payload)
                 )
