@@ -87,12 +87,14 @@ pip install -r requirements.txt
 ```bash
 
 sudo apt install -y \
+    git build-essential \
     meson ninja-build pkg-config \
     libglib2.0-dev libxml2-dev \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     libgirepository1.0-dev gobject-introspection \
-    libusb-1.0-0-dev libzlib-dev \
-    gtk-doc-tools
+    libusb-1.0-0-dev zlib1g-dev \
+    gtk-doc-tools xsltproc \
+    libgtk-3-dev libnotify-dev
 ```
 
 #### Сборка
@@ -102,11 +104,7 @@ git clone https://github.com/AravisProject/aravis.git
 cd aravis
 git checkout 0.10.0     # или нужный тег
 
-meson setup build \
-    -Ddocumentation=disabled \
-    -Dtests=disabled \
-    -Dviewer=disabled \
-    -Dgst-plugin=disabled
+meson setup build
 ninja -C build
 sudo ninja -C build install
 ```
@@ -115,6 +113,12 @@ sudo ninja -C build install
 ```bash
 
 python3 -c "import gi; gi.require_version('Aravis','0.10'); from gi.repository import Aravis; print('Aravis OK')"
+```
+Если при проверке выдает ошибку, то выпоните следующую команду:
+
+```bash
+
+find /usr/local/ -name "Aravis*"
 ```
 
 Когда это реально нужно:
