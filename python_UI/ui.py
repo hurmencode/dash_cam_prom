@@ -489,6 +489,7 @@ class CameraDiscoveryApp:
         type_map = {
             'aravis': 'GigE',
             'gige': 'GigE',
+            'usbcam': 'USB',
             'unknown': 'Unknown'
         }
         return type_map.get(camera_type, camera_type.upper())
@@ -545,9 +546,28 @@ class CameraDiscoveryApp:
                     tags=(camera_type,)
                 )
 
-            self.status_bar.config(
-                text=f"Найдено камер: {len(self.cameras)}"
-            )
+            usbcam_count = sum(1 for c in self.cameras
+                               if c.get('type') == 'usbcam')
+            gigecam_count = sum(1 for c in self.cameras
+                                if c.get('type') in ('aravis', 'gige'))
+
+            parts = []
+            if usbcam_count > 0:
+                parts.append(f"USB: {usbcam_count}")
+            if gigecam_count > 0:
+                parts.append(f"GigE: {gigecam_count}")
+
+            if parts:
+                self.status_bar.config(
+                    text=f"Найдено камер: {len(self.cameras)} "
+                         f"({', '.join(parts)})"
+                )
+            else:
+                self.status_bar.config(
+                    text=f"Найдено камер: {len(self.cameras)}"
+                )
+
+            self.log_info(f"Отображено камер в таблице: {len(self.cameras)}")
 
         self.scan_btn.config(state=tk.NORMAL)
         self.loading_label.config(text="")
@@ -610,6 +630,10 @@ class CameraDiscoveryApp:
                     device_id=device_id,
                     saved_ip=saved_ip,
                     pixel_format="Mono8"
+                )
+            elif camera_type == "usbcam":
+                self.current_camera = create_camera(
+                    'usbcam', device_id=device_id
                 )
             else:
                 self.log_error(f"Неизвестный тип камеры: {camera_type}")
@@ -736,6 +760,7 @@ class CameraDiscoveryApp:
             try:
                 frame = self.current_camera.get_frame()
                 if frame is None:
+                    time.sleep(0.001)
                     continue
 
                 if self._frame_size is None:
@@ -751,13 +776,19 @@ class CameraDiscoveryApp:
                     self.frame_count = 0
                     self.fps_start_time = now
 
-                # Запись — Mono8 идёт в writer напрямую
+                # Запись — кадр идёт в writer как есть
                 if self.is_recording and self.video_recorder:
                     self.video_recorder.write_frame(frame)
 
                 # Отображение — только если включено
                 if self.display_enabled:
-                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    # Mono8 (2D) → BGR, иначе уже BGR
+                    if frame.ndim == 2:
+                        frame_bgr = cv2.cvtColor(
+                            frame, cv2.COLOR_GRAY2BGR
+                        )
+                    else:
+                        frame_bgr = frame
 
                     h, w = frame_bgr.shape[:2]
                     max_w, max_h = 960, 540
@@ -926,6 +957,7 @@ class CameraDiscoveryApp:
             camera_info = self.current_camera.get_info()
             camera_name = camera_info.get('name', 'camera')
 
+            # Гасим отображение на время записи
             self.display_enabled = False
             if self.canvas_image_id:
                 self.video_canvas.delete(self.canvas_image_id)
@@ -936,6 +968,7 @@ class CameraDiscoveryApp:
                 pass
             self.log_info("Отображение отключено на время записи")
 
+            # Если захват не идёт — запускаем без показа
             if not self.is_streaming:
                 self.is_streaming = True
                 self._frame_size = None
@@ -952,20 +985,30 @@ class CameraDiscoveryApp:
                 self.video_control_btn.config(text="Остановить видео")
                 self.log_info("Захват запущен (без отображения)")
 
+            # Ждём первый кадр для определения размера и формата
             self.video_status.config(text="Статус: Инициализация записи...")
             self.root.update_idletasks()
 
+            first_frame = None
             start_wait = time.time()
-            while self._frame_size is None and (time.time() - start_wait) < 3.0:
-                time.sleep(0.02)
+            while first_frame is None and (time.time() - start_wait) < 3.0:
+                first_frame = self.current_camera.get_frame()
+                if first_frame is None:
+                    time.sleep(0.02)
 
-            if self._frame_size is None:
-                self.log_error("Не удалось определить размер кадра")
+            if first_frame is None:
+                self.log_error("Не удалось получить кадр для записи")
                 messagebox.showerror("Ошибка", "Камера не отдаёт кадры")
                 return
 
-            width, height = self._frame_size
+            height, width = first_frame.shape[:2]
+            self._frame_size = (width, height)
+            is_color = (first_frame.ndim == 3)
+
             self.log_info(f"Разрешение кадра: {width}x{height}")
+            self.log_info(
+                f"Формат кадра: {'BGR (color)' if is_color else 'Mono8'}"
+            )
 
             target_fps = int(self.current_fps) if self.current_fps >= 5 else 30
             self.log_info(
@@ -976,7 +1019,7 @@ class CameraDiscoveryApp:
             self.video_recorder = VideoRecorder(
                 output_dir=recordings_dir,
                 fps=target_fps,
-                is_color=False,
+                is_color=is_color,
                 min_free_mb=MIN_FREE_MB,
                 on_disk_full=self._on_disk_full
             )

@@ -12,7 +12,6 @@ import gi
 gi.require_version('Aravis', '0.10')
 from gi.repository import Aravis
 
-cv2.setNumThreads(2)
 
 # ============ БАЗОВЫЙ ИНТЕРФЕЙС ============
 class CameraInterface(ABC):
@@ -29,18 +28,27 @@ class CameraInterface(ABC):
         pass
 
 
-# ============ ВИДЕОРЕКОРДЕР (OpenCV MJPG, Mono8, защита от заполнения диска) ============
+# ============ ВИДЕОРЕКОРДЕР (FFV1 lossless, fallback MJPG) ============
 class VideoRecorder:
     """
-    OpenCV MJPG (isColor=False для Mono8).
-    Каждый кадр независим — нет PTS-конфликтов, нет segfault'ов.
+    Запись видео. Основной кодек — FFV1 (lossless).
+    Если FFV1 не поддерживается сборкой OpenCV — автоматический
+    fallback на MJPG.
+
+    Каждый кадр независим в MJPG — нет PTS-конфликтов.
+    FFV1 — межкадровое lossless сжатие, даёт файлы в 6-8 раз
+    больше MJPG, но без потери качества.
+
     Есть защита от заполнения диска: при свободном месте ниже
     min_free_mb запись останавливается, вызывается on_disk_full.
     """
 
+    # Порядок попыток: сначала FFV1, если не пошёл — MJPG
+    CODEC_PRIORITY = ['FFV1', 'MJPG']
+
     def __init__(self, output_dir: str = "recordings", fps: int = 30,
                  is_color: bool = False,
-                 min_free_mb: int = 500,
+                 min_free_mb: int = 1000,
                  on_disk_full=None):
         self.output_dir = output_dir
         self.fps = max(1, int(fps))
@@ -48,6 +56,7 @@ class VideoRecorder:
         self.min_free_mb = int(min_free_mb)
         self.on_disk_full = on_disk_full
 
+        self.codec = None          # будет выставлен в start_recording
         self.writer = None
         self.is_recording = False
         self.record_path = None
@@ -74,27 +83,49 @@ class VideoRecorder:
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = re.sub(r'[^\w\-_\. ]', '_', camera_name)
-        filename = f"{safe_name}_{timestamp}_mjpg.avi"
-        self.record_path = os.path.join(self.output_dir, filename)
 
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        self.writer = cv2.VideoWriter(
-            self.record_path, fourcc, self.fps,
-            (width, height), isColor=self.is_color
-        )
+        # Перебираем кодеки по приоритету: FFV1 -> MJPG
+        writer = None
+        chosen_codec = None
+        chosen_path = None
 
-        if not self.writer.isOpened():
+        for codec in self.CODEC_PRIORITY:
+            filename = f"{safe_name}_{timestamp}_{codec}.avi"
+            path = os.path.join(self.output_dir, filename)
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            try:
+                w = cv2.VideoWriter(
+                    path, fourcc, self.fps,
+                    (width, height), isColor=self.is_color
+                )
+                if w.isOpened():
+                    writer = w
+                    chosen_codec = codec
+                    chosen_path = path
+                    break
+                else:
+                    w.release()
+                    print(f"[WARN] Кодек {codec} не открылся, "
+                          f"пробую следующий\n")
+            except Exception as e:
+                print(f"[WARN] Ошибка с кодеком {codec}: {e}\n")
+
+        if writer is None:
             raise RuntimeError(
-                f"Failed to create MJPG writer: {self.record_path}\n"
+                "Не удалось создать VideoWriter ни с одним из "
+                f"кодеков: {self.CODEC_PRIORITY}\n"
             )
 
+        self.writer = writer
+        self.codec = chosen_codec
+        self.record_path = chosen_path
         self.is_recording = True
         self.recording_start_time = time.time()
         self.frame_count = 0
         self._last_disk_check = 0.0
         self._disk_full_triggered = False
 
-        print(f"Запись начата (MJPG): {self.record_path}\n")
+        print(f"Запись начата ({self.codec}): {self.record_path}\n")
         print(f"   {width}x{height}, isColor={self.is_color}, "
               f"fps={self.fps}, min_free={self.min_free_mb} MB\n")
         return self.record_path
@@ -150,6 +181,7 @@ class VideoRecorder:
                 file_size = 0.0
 
             print(f"Запись остановлена: {self.record_path}\n")
+            print(f"   Кодек: {self.codec}\n")
             print(f"   Кадров: {self.frame_count}\n")
             print(f"   Длительность: {duration:.1f} сек\n")
             print(f"   Размер видео: {file_size:.2f} MB\n")
@@ -165,7 +197,7 @@ class VideoRecorder:
                          if self.recording_start_time else 0),
             'fps': self.fps,
             'frame_count': self.frame_count,
-            'codec': 'MJPG',
+            'codec': self.codec,
             'is_color': self.is_color,
         }
 
@@ -177,6 +209,62 @@ class VideoRecorder:
             print(f"statvfs error: {e}\n")
             return float('inf')
 
+# ============ USB CAMERA MANAGER (cv2.VideoCapture) ============
+class UsbCameraManager(CameraInterface):
+    """USB-камера через OpenCV VideoCapture. Возвращает BGR (3 канала)."""
+
+    def __init__(self, device_id: int = 0, width: int = None,
+                 height: int = None):
+        self.device_id = device_id
+        self.cap = None
+
+        if os.name == 'nt':
+            self.cap = cv2.VideoCapture(device_id, cv2.CAP_DSHOW)
+        else:
+            self.cap = cv2.VideoCapture(device_id, cv2.CAP_V4L2)
+
+        if width is not None:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        if height is not None:
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        if not self.cap or not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open usbcam {device_id}")
+
+        real_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        real_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        real_fps = self.cap.get(cv2.CAP_PROP_FPS)
+
+        self._info = {
+            'name': f'USB Camera {device_id}',
+            'serial': 'N/A',
+            'ip': 'N/A',
+            'status': 'Connected',
+            'width': real_w,
+            'height': real_h,
+            'fps': real_fps,
+            'is_color': True,   # USB обычно цветная (BGR)
+        }
+        print(f"[INFO] USB camera {device_id}: "
+              f"{real_w}x{real_h} @ {real_fps:.1f} fps\n")
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        if not self.cap or not self.cap.isOpened():
+            return None
+        ret, frame = self.cap.read()
+        return frame if ret else None
+
+    def release(self):
+        if self.cap:
+            try:
+                self.cap.release()
+                print(f"[INFO] USB camera {self.device_id} released.")
+            except Exception as e:
+                print(f"[WARN] USB release error: {e}")
+            self.cap = None
+
+    def get_info(self) -> Dict:
+        return self._info
 
 # ============ ARV CAMERA MANAGER (ARAVIS API) ============
 class ArvCameraManager(CameraInterface):
@@ -236,6 +324,8 @@ class ArvCameraManager(CameraInterface):
                           f"{self.pixel_format}: {e}\n")
 
             self.stream = self.camera.create_stream(None, None)
+
+            # ============ НАСТРОЙКА ТАЙМАУТОВ ПАКЕТОВ ============
             try:
                 self.stream.set_property("packet-timeout", 50000)
                 self.stream.set_property("initial-packet-timeout", 5000)
@@ -243,7 +333,7 @@ class ArvCameraManager(CameraInterface):
                 print(f"[WARN] Could not set stream timeouts: {e}\n")
 
             payload = self.camera.get_payload()
-            for _ in range(20):
+            for _ in range(30):
                 self.stream.push_buffer(
                     Aravis.Buffer.new_allocate(payload)
                 )
@@ -304,7 +394,7 @@ class ArvCameraManager(CameraInterface):
         return self._info
 
 
-# ============ СКАНЕР КАМЕР (только Aravis) ============
+# ============ СКАНЕР КАМЕР ============
 class CameraScanner:
     @staticmethod
     def scan_aravis_cameras() -> List[Dict]:
@@ -354,21 +444,64 @@ class CameraScanner:
         return cameras
 
     @staticmethod
+    def scan_usbcams(max_devices: int = 10) -> List[Dict]:
+        cameras = []
+        for device_id in range(max_devices):
+            try:    
+                if device_id % 2 != 0:
+                    continue
+
+                cap = cv2.VideoCapture(device_id, cv2.CAP_V4L2)
+
+                if cap and cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret:
+                        cameras.append({
+                            'name'      : f'Usbcam {device_id}',
+                            'serial'    : 'N/A',
+                            'ip'        : 'N/A',
+                            'status'    : 'Available',
+                            'type'      : 'usbcam',
+                            'device_id' : device_id
+                        })
+
+                    cap.release()
+
+            except Exception:
+                continue
+
+        return cameras
+
+    @staticmethod
     def scan_all() -> List[Dict]:
+        all_cameras = []
+
+        #GigE cameras
         print("Scanning Aravis cameras...\n")
         arv_cams = CameraScanner.scan_aravis_cameras()
+        all_cameras.extend(arv_cams)
         print(f"Found {len(arv_cams)} Aravis cameras\n")
-        return arv_cams
+
+        #USB cameras
+        print("Scanning USB cameras...\n")
+        usb_cams = CameraScanner.scan_usbcams()
+        all_cameras.extend(usb_cams)
+        print(f"Found {len(usb_cams)} USB cameras\n")
+
+        return all_cameras
 
 
-# ============ ФАБРИКА (только aravis) ============
+# ============ ФАБРИКА ============
 def create_camera(camera_type: str = "aravis", **kwargs) -> CameraInterface:
     if camera_type in ("gige", "aravis"):
         saved_ip = kwargs.get("saved_ip", None)
         return ArvCameraManager(
             pixel_format=kwargs.get("pixel_format", "Mono8"),
             device_index=kwargs.get("device_id", 0),
-            saved_ip=saved_ip
+            saved_ip=saved_ip,
+            target_frame_rate=kwargs.get("target_frame_rate", None)
         )
+    elif camera_type == "usbcam":
+        return UsbCameraManager(device_id=kwargs.get("device_id", 0))
     else:
         raise ValueError(f"Unknown camera type: {camera_type}")

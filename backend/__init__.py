@@ -6,6 +6,7 @@ Backend module for Dash Cam Prom
 # Экспортируем основные классы и функции для удобного импорта
 from .camera_manager import (
     CameraInterface,
+    UsbCameraManager,
     ArvCameraManager,
     CameraScanner,
     create_camera
