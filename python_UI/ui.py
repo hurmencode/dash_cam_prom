@@ -17,11 +17,18 @@ from threading import Thread, Lock
 # Добавляем путь к бэкенду
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from backend.camera_manager import CameraScanner, create_camera, VideoRecorder
+from backend.camera_manager import (
+    CameraScanner, create_camera, VideoRecorder, SegmentingRecorder
+)
 
 
-# Порог свободного места (МБ)
-MIN_FREE_MB = 1000
+# Порог свободного места (МБ). При 12-часовой записи FFV1
+# 1936x1464 нужно ~3 ТБ. Ставь с запасом на 2-3 сегмента вперёд.
+MIN_FREE_MB = 5000
+
+# Длительность одного сегмента — 1 час.
+# За 12 часов получится 12 файлов примерно одинакового размера.
+SEGMENT_DURATION_SEC = 3600
 
 
 class CameraDiscoveryApp:
@@ -84,6 +91,7 @@ class CameraDiscoveryApp:
         self.is_recording = False
         self.current_record_path = None
         self.recording_start_time = None
+        self.segment_paths = []
 
         # Канвас
         self.canvas_image_id = None
@@ -107,10 +115,6 @@ class CameraDiscoveryApp:
 
     # ============ АВАРИЙНЫЕ ОБРАБОТЧИКИ ============
     def install_crash_handlers(self):
-        """Ловим необработанные исключения и сигналы ОС,
-        чтобы успеть сохранить логи перед смертью приложения."""
-
-        # 1. Исключения в main-потоке
         original_hook = sys.excepthook
 
         def excepthook(exc_type, exc_value, exc_tb):
@@ -131,7 +135,6 @@ class CameraDiscoveryApp:
 
         sys.excepthook = excepthook
 
-        # 2. Исключения в фоновых потоках
         def thread_excepthook(args):
             try:
                 self.log_error(
@@ -149,7 +152,6 @@ class CameraDiscoveryApp:
 
         threading.excepthook = thread_excepthook
 
-        # 3. Ctrl+C (SIGINT) и SIGTERM
         def signal_handler(signum, frame):
             try:
                 self.log_warning(
@@ -495,6 +497,18 @@ class CameraDiscoveryApp:
         return type_map.get(camera_type, camera_type.upper())
 
     def scan_cameras(self):
+        if self.current_camera is not None:
+            try:
+                self.stop_video_stream()
+                if self.is_recording:
+                    self.stop_recording()
+                self.log_info("Освобождаю камеру перед сканированием...")
+                self.current_camera.release()
+            except Exception as e:
+                self.log_error(f"Ошибка освобождения камеры: {e}")
+            finally:
+                self.current_camera = None
+
         self.log_info("Запуск сканирования камер...")
         self.scan_btn.config(state=tk.DISABLED)
         self.loading_label.config(text="Поиск камер...")
@@ -600,7 +614,6 @@ class CameraDiscoveryApp:
                                    "Сначала выберите камеру")
             return
 
-        # Освобождаем предыдущую камеру
         self.stop_video_stream()
         if self.is_recording:
             self.stop_recording()
@@ -755,7 +768,6 @@ class CameraDiscoveryApp:
             self.log_info("Видео поток остановлен")
 
     def _capture_loop(self):
-        """Фоновый поток захвата. Tkinter не трогает."""
         while self.is_streaming and self.current_camera:
             try:
                 frame = self.current_camera.get_frame()
@@ -766,7 +778,6 @@ class CameraDiscoveryApp:
                 if self._frame_size is None:
                     self._frame_size = (frame.shape[1], frame.shape[0])
 
-                # FPS
                 self.frame_count += 1
                 now = time.time()
                 if now - self.fps_start_time >= self.fps_update_interval:
@@ -776,13 +787,10 @@ class CameraDiscoveryApp:
                     self.frame_count = 0
                     self.fps_start_time = now
 
-                # Запись — кадр идёт в writer как есть
                 if self.is_recording and self.video_recorder:
                     self.video_recorder.write_frame(frame)
 
-                # Отображение — только если включено
                 if self.display_enabled:
-                    # Mono8 (2D) → BGR, иначе уже BGR
                     if frame.ndim == 2:
                         frame_bgr = cv2.cvtColor(
                             frame, cv2.COLOR_GRAY2BGR
@@ -808,11 +816,13 @@ class CameraDiscoveryApp:
 
                     if self.is_recording and self.recording_start_time:
                         e = time.time() - self.recording_start_time
+                        hh = int(e // 3600)
                         mm = int((e % 3600) // 60)
                         ss = int(e % 60)
-                        tstr = f"REC {mm:02d}:{ss:02d}"
+                        tstr = (f"REC {hh:02d}:{mm:02d}:{ss:02d}"
+                                if hh > 0 else f"REC {mm:02d}:{ss:02d}")
                         cv2.putText(
-                            display, tstr, (dw - 160, 30),
+                            display, tstr, (dw - 200, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale,
                             (0, 0, 255), thickness, cv2.LINE_AA
                         )
@@ -833,7 +843,6 @@ class CameraDiscoveryApp:
                 break
 
     def update_ui_loop(self):
-        """Main-поток. Единственное место работы с Tkinter."""
         try:
             if self.is_streaming and self.display_enabled and self.frame_ready:
                 with self.frame_lock:
@@ -863,6 +872,15 @@ class CameraDiscoveryApp:
 
             if self.is_streaming:
                 self.fps_label.config(text=f"FPS: {self.current_fps:.1f}")
+
+            if self.is_recording and self.video_recorder is not None:
+                remaining = self.video_recorder.get_segment_remaining()
+                idx = self.video_recorder.get_segment_count()
+                self.recording_label.config(
+                    text=f"Запись: ИДЕТ (сегм. {idx}, "
+                         f"до смены {int(remaining // 60)} мин)",
+                    foreground='#ff0000'
+                )
 
             if self.is_streaming and (time.time() % 2 < 0.05):
                 free_mb = self._free_mb(self._current_record_dir())
@@ -930,6 +948,19 @@ class CameraDiscoveryApp:
             f"Запись автоматически остановлена."
         )
 
+    def _on_segment_change(self, index: int, path: str):
+        self.root.after(0, lambda: self._handle_segment_change(index, path))
+
+    def _handle_segment_change(self, index: int, path: str):
+        self.log_info(f"Новый сегмент {index}: {path}")
+        self.recording_label.config(
+            text=f"Запись: ИДЕТ (сегм. {index})",
+            foreground='#ff0000'
+        )
+        self.video_status.config(
+            text=f"Статус: Запись идет, сегмент {index}"
+        )
+
     def start_recording(self):
         if not self.current_camera:
             messagebox.showwarning("Предупреждение",
@@ -957,7 +988,6 @@ class CameraDiscoveryApp:
             camera_info = self.current_camera.get_info()
             camera_name = camera_info.get('name', 'camera')
 
-            # Гасим отображение на время записи
             self.display_enabled = False
             if self.canvas_image_id:
                 self.video_canvas.delete(self.canvas_image_id)
@@ -968,7 +998,6 @@ class CameraDiscoveryApp:
                 pass
             self.log_info("Отображение отключено на время записи")
 
-            # Если захват не идёт — запускаем без показа
             if not self.is_streaming:
                 self.is_streaming = True
                 self._frame_size = None
@@ -985,7 +1014,6 @@ class CameraDiscoveryApp:
                 self.video_control_btn.config(text="Остановить видео")
                 self.log_info("Захват запущен (без отображения)")
 
-            # Ждём первый кадр для определения размера и формата
             self.video_status.config(text="Статус: Инициализация записи...")
             self.root.update_idletasks()
 
@@ -1015,30 +1043,39 @@ class CameraDiscoveryApp:
                 f"FPS записи: {target_fps} "
                 f"(измеренный {self.current_fps:.1f})"
             )
+            self.log_info(
+                f"Сегментация: {SEGMENT_DURATION_SEC // 60} мин на файл"
+            )
 
-            self.video_recorder = VideoRecorder(
+            self.segment_paths = []
+            self.video_recorder = SegmentingRecorder(
                 output_dir=recordings_dir,
                 fps=target_fps,
                 is_color=is_color,
                 min_free_mb=MIN_FREE_MB,
-                on_disk_full=self._on_disk_full
+                on_disk_full=self._on_disk_full,
+                segment_seconds=SEGMENT_DURATION_SEC,
+                camera_name=camera_name,
+                on_segment_change=self._on_segment_change
             )
 
-            self.current_record_path = self.video_recorder.start_recording(
-                width, height, camera_name
-            )
+            if not self.video_recorder.start(width, height):
+                raise RuntimeError("Не удалось начать запись первого сегмента")
+
+            self.current_record_path = self.video_recorder.get_segment_paths()[-1]
 
             self.recording_start_time = time.time()
             self.is_recording = True
             self.record_btn.config(text="Остановить запись")
             self.recording_label.config(
-                text="Запись: ИДЕТ", foreground='#ff0000'
+                text="Запись: ИДЕТ (сегм. 1)", foreground='#ff0000'
             )
             self.log_success(
-                f"Запись начата: {self.current_record_path}"
+                f"Запись начата. Сегмент 1: {self.current_record_path}"
             )
             self.video_status.config(
-                text="Статус: Запись идет (отображение выкл.)"
+                text=f"Статус: Запись идет, сегмент 1 "
+                     f"({SEGMENT_DURATION_SEC // 60} мин)"
             )
 
         except Exception as e:
@@ -1051,7 +1088,7 @@ class CameraDiscoveryApp:
         if not self.is_recording or not self.video_recorder:
             return
         try:
-            saved_path = self.video_recorder.stop_recording()
+            segment_paths = self.video_recorder.stop()
             self.is_recording = False
             self.recording_start_time = None
             self.video_recorder = None
@@ -1066,18 +1103,24 @@ class CameraDiscoveryApp:
             else:
                 self.display_enabled = False
 
-            if saved_path:
-                self.log_success(f"Запись сохранена: {saved_path}")
-                self.video_status.config(
-                    text=f"Статус: Запись сохранена: "
-                         f"{os.path.basename(saved_path)}"
+            if segment_paths:
+                self.log_success(
+                    f"Запись завершена. Сегментов: {len(segment_paths)}"
                 )
+                for p in segment_paths:
+                    self.log_info(f"  • {p}")
+
+                self.video_status.config(
+                    text=f"Статус: Записано сегментов: {len(segment_paths)}"
+                )
+
                 if messagebox.askyesno(
                     "Запись завершена",
-                    f"Видео сохранено в:\n{saved_path}\n\n"
+                    f"Сохранено сегментов: {len(segment_paths)}\n\n"
+                    f"Первый файл:\n{segment_paths[0]}\n\n"
                     f"Открыть папку?"
                 ):
-                    dir_path = os.path.dirname(saved_path)
+                    dir_path = os.path.dirname(segment_paths[0])
                     if platform.system() == 'Windows':
                         os.startfile(dir_path)
                     elif platform.system() == 'Darwin':

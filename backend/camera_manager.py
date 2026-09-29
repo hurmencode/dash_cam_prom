@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from typing import Optional, List, Dict
 import re
 import time
+import gc
+import threading
 from datetime import datetime
 
 # Импортируем Aravis
@@ -31,19 +33,14 @@ class CameraInterface(ABC):
 # ============ ВИДЕОРЕКОРДЕР (FFV1 lossless, fallback MJPG) ============
 class VideoRecorder:
     """
-    Запись видео. Основной кодек — FFV1 (lossless).
-    Если FFV1 не поддерживается сборкой OpenCV — автоматический
-    fallback на MJPG.
+    Запись одного сегмента видео.
+    Основной кодек — FFV1 (lossless), fallback — MJPG.
 
-    Каждый кадр независим в MJPG — нет PTS-конфликтов.
-    FFV1 — межкадровое lossless сжатие, даёт файлы в 6-8 раз
-    больше MJPG, но без потери качества.
-
+    Для Mono8-камер (GigE) isColor=False, для USB-камер (BGR) isColor=True.
     Есть защита от заполнения диска: при свободном месте ниже
     min_free_mb запись останавливается, вызывается on_disk_full.
     """
 
-    # Порядок попыток: сначала FFV1, если не пошёл — MJPG
     CODEC_PRIORITY = ['FFV1', 'MJPG']
 
     def __init__(self, output_dir: str = "recordings", fps: int = 30,
@@ -56,7 +53,7 @@ class VideoRecorder:
         self.min_free_mb = int(min_free_mb)
         self.on_disk_full = on_disk_full
 
-        self.codec = None          # будет выставлен в start_recording
+        self.codec = None
         self.writer = None
         self.is_recording = False
         self.record_path = None
@@ -84,7 +81,6 @@ class VideoRecorder:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = re.sub(r'[^\w\-_\. ]', '_', camera_name)
 
-        # Перебираем кодеки по приоритету: FFV1 -> MJPG
         writer = None
         chosen_codec = None
         chosen_path = None
@@ -112,7 +108,7 @@ class VideoRecorder:
 
         if writer is None:
             raise RuntimeError(
-                "Не удалось создать VideoWriter ни с одним из "
+                f"Не удалось создать VideoWriter ни с одним из "
                 f"кодеков: {self.CODEC_PRIORITY}\n"
             )
 
@@ -209,6 +205,170 @@ class VideoRecorder:
             print(f"statvfs error: {e}\n")
             return float('inf')
 
+
+# ============ СЕГМЕНТИРОВАННЫЙ РЕКОРДЕР ============
+class SegmentingRecorder:
+    """
+    Обёртка над VideoRecorder, которая каждые segment_seconds
+    закрывает текущий файл и открывает новый.
+
+    Для 12-часовой записи с segment_seconds=3600 получится
+    12 файлов примерно одинакового размера.
+
+    При выключении питания теряется максимум один сегмент
+    (текущий), все закрытые остаются целыми.
+    """
+
+    def __init__(self, output_dir: str, fps: int, is_color: bool,
+                 min_free_mb: int = 1000,
+                 on_disk_full=None,
+                 segment_seconds: int = 3600,
+                 camera_name: str = "camera",
+                 on_segment_change=None):
+        self.output_dir = output_dir
+        self.fps = fps
+        self.is_color = is_color
+        self.min_free_mb = min_free_mb
+        self.on_disk_full = on_disk_full
+        self.segment_seconds = max(60, int(segment_seconds))
+        self.camera_name = camera_name
+        self.on_segment_change = on_segment_change
+
+        self._recorder = None
+        self._width = None
+        self._height = None
+        self._segment_start_time = None
+        self._segment_index = 0
+        self._segment_paths = []
+        self._is_recording = False
+        self._stop_requested = False
+
+        self._thread = None
+        self._thread_lock = threading.Lock()
+
+    # ---------- Публичные ----------
+    def start(self, width: int, height: int) -> bool:
+        if self._is_recording:
+            return False
+
+        self._width = width
+        self._height = height
+        self._segment_index = 0
+        self._segment_paths = []
+        self._stop_requested = False
+        self._is_recording = True
+
+        if not self._start_new_segment():
+            self._is_recording = False
+            return False
+
+        self._thread = threading.Thread(
+            target=self._segment_loop, daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def write_frame(self, frame: np.ndarray) -> bool:
+        if not self._is_recording or self._recorder is None:
+            return False
+        return self._recorder.write_frame(frame)
+
+    def stop(self) -> List[str]:
+        """Останавливает запись, возвращает список путей всех сегментов."""
+        if not self._is_recording and self._recorder is None:
+            return list(self._segment_paths)
+
+        self._is_recording = False
+        self._stop_requested = True
+
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+
+        if self._recorder is not None:
+            try:
+                self._recorder.stop_recording()
+            except Exception as e:
+                print(f"[WARN] Error stopping segment: {e}\n")
+            self._recorder = None
+
+        return list(self._segment_paths)
+
+    def get_segment_count(self) -> int:
+        return self._segment_index
+
+    def get_segment_paths(self) -> List[str]:
+        return list(self._segment_paths)
+
+    def get_elapsed_in_segment(self) -> float:
+        if self._segment_start_time is None:
+            return 0.0
+        return time.time() - self._segment_start_time
+
+    def get_segment_remaining(self) -> float:
+        if self._segment_start_time is None:
+            return 0.0
+        return max(0.0, self.segment_seconds -
+                   (time.time() - self._segment_start_time))
+
+    # ---------- Внутренние ----------
+    def _start_new_segment(self) -> bool:
+        self._segment_index += 1
+        segment_name = f"{self.camera_name}_part{self._segment_index:03d}"
+        try:
+            self._recorder = VideoRecorder(
+                output_dir=self.output_dir,
+                fps=self.fps,
+                is_color=self.is_color,
+                min_free_mb=self.min_free_mb,
+                on_disk_full=self.on_disk_full
+            )
+            path = self._recorder.start_recording(
+                self._width, self._height, segment_name
+            )
+            self._segment_paths.append(path)
+            self._segment_start_time = time.time()
+
+            if self.on_segment_change is not None:
+                try:
+                    self.on_segment_change(self._segment_index, path)
+                except Exception as e:
+                    print(f"[WARN] on_segment_change error: {e}\n")
+
+            print(f"[INFO] Сегмент {self._segment_index} открыт: {path}\n")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Could not start segment "
+                  f"{self._segment_index}: {e}\n")
+            self._recorder = None
+            return False
+
+    def _segment_loop(self):
+        """Раз в секунду проверяем, не пора ли закрыть сегмент."""
+        while self._is_recording and not self._stop_requested:
+            time.sleep(1.0)
+
+            if not self._is_recording or self._stop_requested:
+                break
+
+            elapsed = time.time() - self._segment_start_time
+            if elapsed >= self.segment_seconds:
+                with self._thread_lock:
+                    if not self._is_recording:
+                        break
+                    print(f"[INFO] Сегмент {self._segment_index} "
+                          f"закрыт ({elapsed:.0f} сек), открываю новый\n")
+                    try:
+                        self._recorder.stop_recording()
+                    except Exception as e:
+                        print(f"[WARN] Error closing segment: {e}\n")
+                    self._recorder = None
+
+                    if not self._start_new_segment():
+                        self._is_recording = False
+                        break
+
+
 # ============ USB CAMERA MANAGER (cv2.VideoCapture) ============
 class UsbCameraManager(CameraInterface):
     """USB-камера через OpenCV VideoCapture. Возвращает BGR (3 канала)."""
@@ -243,7 +403,7 @@ class UsbCameraManager(CameraInterface):
             'width': real_w,
             'height': real_h,
             'fps': real_fps,
-            'is_color': True,   # USB обычно цветная (BGR)
+            'is_color': True,
         }
         print(f"[INFO] USB camera {device_id}: "
               f"{real_w}x{real_h} @ {real_fps:.1f} fps\n")
@@ -262,9 +422,11 @@ class UsbCameraManager(CameraInterface):
             except Exception as e:
                 print(f"[WARN] USB release error: {e}")
             self.cap = None
+            gc.collect()
 
     def get_info(self) -> Dict:
         return self._info
+
 
 # ============ ARV CAMERA MANAGER (ARAVIS API) ============
 class ArvCameraManager(CameraInterface):
@@ -314,6 +476,24 @@ class ArvCameraManager(CameraInterface):
             print(f"Connected Aravis: {model_name} "
                   f"(SN: {serial}, IP: {ip.to_string()})\n")
 
+            if self.target_frame_rate is not None:
+                try:
+                    device.set_boolean_feature_value(
+                        "AcquisitionFrameRateEnable", True
+                    )
+                    device.set_float_feature_value(
+                        "AcquisitionFrameRate",
+                        float(self.target_frame_rate)
+                    )
+                    actual_rate = device.get_float_feature_value(
+                        "AcquisitionFrameRate"
+                    )
+                    print(f"AcquisitionFrameRate = {actual_rate} Hz "
+                          f"(запрошено {self.target_frame_rate})\n")
+                except Exception as e:
+                    print(f"[WARN] Could not set frame rate "
+                          f"{self.target_frame_rate}: {e}\n")
+
             if self.pixel_format:
                 try:
                     self.camera.set_pixel_format_from_string(
@@ -325,7 +505,6 @@ class ArvCameraManager(CameraInterface):
 
             self.stream = self.camera.create_stream(None, None)
 
-            # ============ НАСТРОЙКА ТАЙМАУТОВ ПАКЕТОВ ============
             try:
                 self.stream.set_property("packet-timeout", 50000)
                 self.stream.set_property("initial-packet-timeout", 5000)
@@ -446,29 +625,80 @@ class CameraScanner:
     @staticmethod
     def scan_usbcams(max_devices: int = 10) -> List[Dict]:
         cameras = []
-        for device_id in range(max_devices):
-            try:    
-                if device_id % 2 != 0:
-                    continue
 
-                cap = cv2.VideoCapture(device_id, cv2.CAP_V4L2)
+        existing_devices = []
+        if os.path.isdir('/dev'):
+            for name in os.listdir('/dev'):
+                if name.startswith('video'):
+                    suffix = name[len('video'):]
+                    if suffix.isdigit():
+                        idx = int(suffix)
+                        if idx < max_devices:
+                            existing_devices.append(idx)
+        existing_devices.sort()
 
-                if cap and cap.isOpened():
+        saved_stderr_fd = None
+        devnull_fd = None
+        try:
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            saved_stderr_fd = os.dup(2)
+            os.dup2(devnull_fd, 2)
+        except Exception as e:
+            print(f"[WARN] Could not suppress stderr: {e}")
+            saved_stderr_fd = None
+
+        try:
+            for device_id in existing_devices:
+                cap = None
+                try:
+                    if os.name == 'nt':
+                        cap = cv2.VideoCapture(device_id, cv2.CAP_DSHOW)
+                    else:
+                        cap = cv2.VideoCapture(device_id, cv2.CAP_V4L2)
+
+                    if not cap or not cap.isOpened():
+                        continue
+
                     ret, frame = cap.read()
-                    if ret:
-                        cameras.append({
-                            'name'      : f'Usbcam {device_id}',
-                            'serial'    : 'N/A',
-                            'ip'        : 'N/A',
-                            'status'    : 'Available',
-                            'type'      : 'usbcam',
-                            'device_id' : device_id
-                        })
+                    if not ret or frame is None:
+                        continue
 
-                    cap.release()
-
-            except Exception:
-                continue
+                    h, w = frame.shape[:2]
+                    print(f"Found USB camera {device_id}: {w}x{h}\n")
+                    cameras.append({
+                        'name': f'USB Camera {device_id}',
+                        'serial': 'N/A',
+                        'ip': 'N/A',
+                        'status': 'Available',
+                        'type': 'usbcam',
+                        'device_id': device_id,
+                        '_saved_ip': None,
+                        'width': w,
+                        'height': h
+                    })
+                except Exception:
+                    pass
+                finally:
+                    if cap is not None:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        del cap
+                        gc.collect()
+                    time.sleep(0.05)
+        finally:
+            if saved_stderr_fd is not None:
+                try:
+                    os.dup2(saved_stderr_fd, 2)
+                    os.close(saved_stderr_fd)
+                except Exception:
+                    pass
+            if devnull_fd is not None:
+                try:
+                    os.close(devnull_fd)
+                except Exception:
+                    pass
 
         return cameras
 
@@ -476,13 +706,11 @@ class CameraScanner:
     def scan_all() -> List[Dict]:
         all_cameras = []
 
-        #GigE cameras
         print("Scanning Aravis cameras...\n")
         arv_cams = CameraScanner.scan_aravis_cameras()
         all_cameras.extend(arv_cams)
         print(f"Found {len(arv_cams)} Aravis cameras\n")
 
-        #USB cameras
         print("Scanning USB cameras...\n")
         usb_cams = CameraScanner.scan_usbcams()
         all_cameras.extend(usb_cams)
