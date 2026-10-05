@@ -7,6 +7,7 @@ import re
 import time
 import gc
 import threading
+import subprocess
 from datetime import datetime
 
 # Импортируем Aravis
@@ -368,6 +369,84 @@ class SegmentingRecorder:
                         self._is_recording = False
                         break
 
+# ============ V4L2 INFO HELPERS ============
+
+def _v4l2_info(device_id: int) -> dict:
+    """
+    Возвращает dict с model / serial / driver / bus для /dev/videoN
+    через v4l2-ctl --info. Если поле не найдено — значение 'N/A'.
+    """
+    result = {
+        'model': 'N/A',
+        'serial': 'N/A',
+        'driver': 'N/A',
+        'bus': 'N/A',
+    }
+    try:
+        out = subprocess.run(
+            ['v4l2-ctl', '-d', f'/dev/video{device_id}', '--info'],
+            capture_output=True, text=True, timeout=2.0
+        )
+        if out.returncode != 0:
+            return result
+
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if ':' not in line:
+                continue
+            key, _, value = line.partition(':')
+            key = key.strip().lower()
+            value = value.strip()
+
+            if key == 'card type':
+                result['model'] = value
+            elif key == 'bus info':
+                # Пример: "usb-0000:00:14.0-1" — вытащим серийник
+                # из /sys, потому что v4l2-ctl напрямую серийник
+                # USB-камеры не показывает
+                result['bus'] = value
+            elif key == 'driver name':
+                result['driver'] = value
+    except FileNotFoundError:
+        # v4l2-ctl не установлен
+        pass
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+
+    # Дополнительно вытащим серийник USB-устройства через /sys
+    result['serial'] = _usb_serial_from_sys(device_id)
+    return result
+
+
+def _usb_serial_from_sys(device_id: int) -> str:
+    """
+    Пытается найти серийный номер USB-камеры через /sys/class/video4linux.
+    Возвращает 'N/A', если не найдено.
+    """
+    try:
+        # /sys/class/video4linux/video0/device → симлинк в USB-устройство
+        base = f'/sys/class/video4linux/video{device_id}/device'
+        if not os.path.exists(base):
+            return 'N/A'
+
+        # Идём вверх по дереву, ищем папку с файлом "serial"
+        real = os.path.realpath(base)
+        for _ in range(6):
+            serial_path = os.path.join(real, 'serial')
+            if os.path.isfile(serial_path):
+                with open(serial_path, 'r') as f:
+                    val = f.read().strip()
+                    if val:
+                        return val
+            parent = os.path.dirname(real)
+            if parent == real:
+                break
+            real = parent
+    except Exception:
+        pass
+    return 'N/A'
 
 # ============ USB CAMERA MANAGER (cv2.VideoCapture) ============
 class UsbCameraManager(CameraInterface):
@@ -395,17 +474,31 @@ class UsbCameraManager(CameraInterface):
         real_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         real_fps = self.cap.get(cv2.CAP_PROP_FPS)
 
+        # ---- Достаём имя модели и серийник через v4l2-ctl ----
+        info = _v4l2_info(device_id) if os.name != 'nt' else {
+            'model': 'N/A', 'serial': 'N/A',
+            'driver': 'N/A', 'bus': 'N/A'
+        }
+
+        model_name = info['model'] if info['model'] != 'N/A' \
+            else f'USB Camera {device_id}'
+
         self._info = {
-            'name': f'USB Camera {device_id}',
-            'serial': 'N/A',
+            'name': model_name,
+            'serial': info['serial'],
             'ip': 'N/A',
             'status': 'Connected',
             'width': real_w,
             'height': real_h,
             'fps': real_fps,
             'is_color': True,
+            'driver': info['driver'],
+            'bus': info['bus'],
+            'device_id': device_id,
         }
         print(f"[INFO] USB camera {device_id}: "
+              f"{model_name} "
+              f"(SN: {info['serial']}) "
               f"{real_w}x{real_h} @ {real_fps:.1f} fps\n")
 
     def get_frame(self) -> Optional[np.ndarray]:
@@ -664,10 +757,22 @@ class CameraScanner:
                         continue
 
                     h, w = frame.shape[:2]
-                    print(f"Found USB camera {device_id}: {w}x{h}\n")
+
+                    # Достаём модель и серийник
+                    info = _v4l2_info(device_id) if os.name != 'nt' else {
+                        'model': 'N/A', 'serial': 'N/A'
+                    }
+                    model_name = info['model'] if info['model'] != 'N/A' \
+                        else f'USB Camera {device_id}'
+
+                    print(f"Found USB camera {device_id}: "
+                        f"{model_name} "
+                        f"(SN: {info['serial']}) "
+                        f"{w}x{h}\n")
+
                     cameras.append({
-                        'name': f'USB Camera {device_id}',
-                        'serial': 'N/A',
+                        'name': model_name,
+                        'serial': info['serial'],
                         'ip': 'N/A',
                         'status': 'Available',
                         'type': 'usbcam',
