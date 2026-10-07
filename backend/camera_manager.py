@@ -42,7 +42,7 @@ class VideoRecorder:
     min_free_mb запись останавливается, вызывается on_disk_full.
     """
 
-    CODEC_PRIORITY = ['FFV1', 'MJPG']
+    CODEC_PRIORITY = ['MJPG']
 
     def __init__(self, output_dir: str = "recordings", fps: int = 30,
                  is_color: bool = False,
