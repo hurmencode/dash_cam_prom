@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import re
 import cv2
 from datetime import datetime

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Видеорегистратор 3000
+Exec=/home/granit/dash_cam_prom/run.sh
+Icon=/home/granit/dash_cam_prom/favicon.png
+Terminal=false
+Categories=Utility;Video;

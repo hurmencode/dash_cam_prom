@@ -15,7 +15,7 @@ from .camera_manager import (
 # Определяем, что экспортируется при импорте *
 __all__ = [
     'CameraInterface',
-    'WebcamManager', 
+    'UsbCameraManager', 
     'ArvCameraManager',
     'CameraScanner',
     'create_camera'
