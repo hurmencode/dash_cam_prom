@@ -48,13 +48,13 @@ class SlotState:
         self.segment_paths = []
         self.recording_start_time = None
 
-        # Превью в отдельном окне
-        self.preview_window = None       # tk.Toplevel
-        self.preview_canvas = None       # tk.Canvas внутри окна
-        self.preview_image_id = None     # id картинки на Canvas
+        self.preview_window = None
+        self.preview_canvas = None
+        self.preview_image_id = None
 
-        # Ссылка на ttk.Label с FPS в главном окне
+        self.slot_info_label = None
         self.fps_label = None
+        self.show_btn = None
 
 
 class CameraDiscoveryApp:
@@ -71,7 +71,6 @@ class CameraDiscoveryApp:
 
         self.root.geometry("1100x700")
 
-        # Логи
         log_dir = os.path.join(os.path.expanduser("~"),
                                "dash_cam_prom", "logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -84,13 +83,13 @@ class CameraDiscoveryApp:
             print(f"Не удалось открыть файл логов: {e}")
             self.log_file = None
 
-        # Два слота — без привязки к типу
         self.slots = {
             'slot_1': SlotState('slot_1'),
             'slot_2': SlotState('slot_2'),
         }
         self.cameras = []
         self.is_recording = False
+        self.connected_cameras = {}
 
         self.create_widgets()
         self.install_crash_handlers()
@@ -173,7 +172,6 @@ class CameraDiscoveryApp:
             return
         self._closing = True
 
-        # Закрываем окна превью
         for slot in self.slots.values():
             slot.is_streaming = False
             slot.display_enabled = False
@@ -251,7 +249,8 @@ class CameraDiscoveryApp:
             self.camera_tab,
             text="Выберите одну или две камеры (Ctrl+Click). "
                  "Максимум 2 камеры одновременно.\n"
-                 "При подключении откроется отдельное окно превью.",
+                 "Для просмотра видео перейдите на вкладку "
+                 "«Управление».",
             foreground="#666666", justify=tk.LEFT)
         hint.pack(anchor=tk.W, padx=10, pady=(0, 5))
 
@@ -300,11 +299,6 @@ class CameraDiscoveryApp:
             font=('Arial', 11, 'bold'), foreground="#555555")
         self.disk_label.pack(side=tk.LEFT, padx=20)
 
-        self.video_control_btn = ttk.Button(
-            controls_frame, text="Остановить видео",
-            command=self.toggle_video, width=18, state=tk.DISABLED)
-        self.video_control_btn.pack(side=tk.RIGHT, padx=5)
-
         self.record_btn = ttk.Button(
             controls_frame, text="Записать видео",
             command=self.toggle_recording, width=18, state=tk.DISABLED)
@@ -315,7 +309,23 @@ class CameraDiscoveryApp:
             command=self.take_snapshot, width=15, state=tk.DISABLED)
         self.snapshot_btn.pack(side=tk.RIGHT, padx=5)
 
-        # Информация по слотам
+        # Вторая строка — кнопки «Показать все / Скрыть все»
+        preview_frame = ttk.Frame(self.video_tab, padding="10")
+        preview_frame.pack(fill=tk.X)
+
+        self.preview_all_btn = ttk.Button(
+            preview_frame, text="Показать все",
+            command=self.toggle_all_previews,
+            width=20, state=tk.DISABLED)
+        self.preview_all_btn.pack(side=tk.LEFT, padx=5)
+
+        self.preview_hint = ttk.Label(
+            preview_frame,
+            text="Открывает / закрывает окна превью для всех "
+                 "подключённых камер",
+            foreground="#666666")
+        self.preview_hint.pack(side=tk.LEFT, padx=10)
+
         slots_frame = ttk.LabelFrame(
             self.video_tab, text="Подключённые камеры", padding="10")
         slots_frame.pack(fill=tk.X, padx=10, pady=10)
@@ -326,7 +336,7 @@ class CameraDiscoveryApp:
 
             name_lbl = ttk.Label(
                 row, text=f"Слот {i + 1}: —",
-                font=('Arial', 10, 'bold'), width=40, anchor='w')
+                font=('Arial', 10, 'bold'), width=45, anchor='w')
             name_lbl.pack(side=tk.LEFT, padx=5)
             slot.slot_info_label = name_lbl
 
@@ -337,9 +347,9 @@ class CameraDiscoveryApp:
             slot.fps_label = fps_lbl
 
             show_btn = ttk.Button(
-                row, text="Показать / Скрыть",
+                row, text="Показать",
                 command=lambda sn=slot_name: self.toggle_preview(sn),
-                width=20, state=tk.DISABLED)
+                width=15, state=tk.DISABLED)
             show_btn.pack(side=tk.RIGHT, padx=5)
             slot.show_btn = show_btn
 
@@ -426,8 +436,16 @@ class CameraDiscoveryApp:
             'usbcam': 'USB', 'unknown': 'Unknown',
         }.get(camera_type, camera_type.upper())
 
+    def _camera_key(self, cam_info):
+        cam_type = cam_info.get('type', 'unknown')
+        if cam_type == 'usbcam':
+            return ('usb', cam_info.get('device_id', 0))
+        serial = cam_info.get('serial')
+        if serial and serial not in ('', 'N/A', 'Unknown'):
+            return ('gige', serial)
+        return ('gige', cam_info.get('ip', 'N/A'))
+
     def scan_cameras(self):
-        # Освобождаем всё перед сканированием
         self.disconnect_all(silent=True)
 
         self.log_info("Запуск сканирования камер...")
@@ -460,12 +478,16 @@ class CameraDiscoveryApp:
             self.log_warning("Камеры не найдены")
         else:
             for cam in self.cameras:
-                status = cam.get('status', 'Unknown')
-                status_display = {
-                    'Available': 'Доступна',
-                    'Connected': 'Подключена',
-                    'Failed': 'Ошибка'
-                }.get(status, 'Неизвестно')
+                key = self._camera_key(cam)
+                if key in self.connected_cameras:
+                    status_display = 'Подключена'
+                else:
+                    status_display = {
+                        'Available': 'Доступна',
+                        'Connected': 'Подключена',
+                        'Failed': 'Ошибка'
+                    }.get(cam.get('status', 'Unknown'), 'Неизвестно')
+
                 ip = cam.get('ip', 'N/A') or 'N/A'
                 camera_type = cam.get('type', 'unknown')
                 self.tree.insert(
@@ -505,41 +527,12 @@ class CameraDiscoveryApp:
             self.connect_btn.config(state=tk.DISABLED)
 
     def _get_free_slots(self):
-        """Возвращает список свободных слотов."""
         return [name for name, slot in self.slots.items()
                 if slot.camera is None]
 
     def _is_camera_connected(self, cam_info):
-        """Проверяет, не подключена ли уже эта камера.
-        Для USB используем device_id — серийники у дешёвых UVC-камер
-        часто одинаковые ('01.00.00'). Для GigE — serial или ip."""
-        cam_type = cam_info.get('type', 'unknown')
-        cam_device_id = cam_info.get('device_id')
-        cam_serial = cam_info.get('serial')
-        cam_ip = cam_info.get('ip')
-
-        for slot in self.slots.values():
-            if slot.camera_info is None:
-                continue
-
-            info = slot.camera_info
-
-            # Для USB: идентифицируем по device_id (уникален)
-            if cam_type == 'usbcam':
-                if (info.get('type') == 'usbcam' and
-                        info.get('device_id') == cam_device_id):
-                    return True
-                continue
-
-            # Для GigE: serial (если не пустой), иначе ip
-            if cam_serial and cam_serial not in ('', 'N/A', 'Unknown'):
-                if info.get('serial') == cam_serial:
-                    return True
-            elif cam_ip and cam_ip not in ('', 'N/A', 'Unknown'):
-                if info.get('ip') == cam_ip:
-                    return True
-
-        return False
+        key = self._camera_key(cam_info)
+        return key in self.connected_cameras
 
     def connect_camera(self):
         selection = self.tree.selection()
@@ -557,7 +550,6 @@ class CameraDiscoveryApp:
         if not selected_cams:
             return
 
-        # Фильтруем уже подключённые
         cams_to_connect = []
         for cam in selected_cams:
             if self._is_camera_connected(cam):
@@ -581,6 +573,9 @@ class CameraDiscoveryApp:
                 f"Максимум 2 камеры одновременно.")
             cams_to_connect = cams_to_connect[:len(free_slots)]
 
+        connected_names = []
+        failed_names = []
+
         for cam, slot_name in zip(cams_to_connect, free_slots):
             slot = self.slots[slot_name]
             try:
@@ -602,48 +597,70 @@ class CameraDiscoveryApp:
                 slot.camera = new_cam
                 slot.camera_info = cam
 
-                # Обновляем метку в UI
+                key = self._camera_key(cam)
+                self.connected_cameras[key] = slot_name
+
                 cam_name = cam.get('name', 'Unknown')
                 cam_type = self.get_type_display(camera_type)
-                self._update_slot_label(slot, f"{cam_type}: {cam_name}")
+                self._update_slot_label(
+                    slot, f"Слот {list(self.slots.keys()).index(slot_name) + 1}: "
+                          f"{cam_type} — {cam_name}")
 
-                # Активируем кнопку показа превью
                 slot.show_btn.config(state=tk.NORMAL)
 
                 self.log_success(
                     f"Подключено: {cam_name} → {slot_name}")
-
-                # Открываем окно превью
-                self._open_preview_window(slot)
+                connected_names.append(cam_name)
 
             except Exception as e:
                 self.log_error(
                     f"Не удалось подключить {cam['name']}: {e}")
+                failed_names.append(cam['name'])
 
-        # Проверяем, есть ли активные камеры
+        self._refresh_table_statuses()
+
         any_active = any(s.camera is not None
                          for s in self.slots.values())
         if any_active:
-            self.video_control_btn.config(state=tk.NORMAL)
             self.snapshot_btn.config(state=tk.NORMAL)
             self.record_btn.config(state=tk.NORMAL)
+            self.preview_all_btn.config(state=tk.NORMAL)
+            self._update_preview_all_btn()
 
-            # Запускаем захват для новых слотов
-            self.start_video_stream()
+        if connected_names:
+            msg = "Успешно подключено:\n  • " + "\n  • ".join(connected_names)
+            msg += ("\n\nДля просмотра видео перейдите на вкладку "
+                    "«Управление» и нажмите «Показать все» "
+                    "или «Показать» напротив нужной камеры.")
+            if failed_names:
+                msg += ("\n\nНе удалось подключить:\n  • "
+                        + "\n  • ".join(failed_names))
+            messagebox.showinfo("Подключение", msg)
 
-            # Переключаемся на вкладку управления
-            self.notebook.select(self.video_tab)
-            self.log_success("Готово к работе: видео запущено")
+    def _refresh_table_statuses(self):
+        for item in self.tree.get_children():
+            values = self.tree.item(item, 'values')
+            if not values:
+                continue
+            cam_name = values[0]
+            for cam in self.cameras:
+                if cam.get('name') == cam_name:
+                    key = self._camera_key(cam)
+                    new_values = list(values)
+                    if key in self.connected_cameras:
+                        new_values[4] = 'Подключена'
+                    else:
+                        if values[4] == 'Подключена':
+                            new_values[4] = 'Доступна'
+                    self.tree.item(item, values=tuple(new_values))
+                    break
 
     def _update_slot_label(self, slot, text):
-        """Обновляет подпись слота в главном окне."""
-        if hasattr(slot, 'slot_info_label') and slot.slot_info_label:
-            slot.slot_info_label.config(text=f"{slot.name}: {text}")
+        if slot.slot_info_label:
+            slot.slot_info_label.config(text=text)
 
     def disconnect_all(self, silent=False):
-        """Отключает все камеры, закрывает окна превью."""
         for slot_name, slot in self.slots.items():
-            # Останавливаем запись если идёт
             if slot.recorder is not None:
                 try:
                     slot.recorder.stop()
@@ -655,10 +672,8 @@ class CameraDiscoveryApp:
             slot.is_streaming = False
             slot.display_enabled = False
 
-            # Закрываем окно превью
             self._close_preview_window(slot, silent=silent)
 
-            # Освобождаем камеру
             if slot.camera is not None:
                 try:
                     slot.camera.release()
@@ -669,24 +684,25 @@ class CameraDiscoveryApp:
                 slot.camera = None
             slot.camera_info = None
 
-            # Сбрасываем метки
             idx = list(self.slots.keys()).index(slot_name)
-            self._update_slot_label(slot, "—")
+            self._update_slot_label(slot, f"Слот {idx + 1}: —")
             if slot.fps_label:
                 slot.fps_label.config(text="FPS: —")
-            if hasattr(slot, 'show_btn') and slot.show_btn:
-                slot.show_btn.config(state=tk.DISABLED)
+            if slot.show_btn:
+                slot.show_btn.config(state=tk.DISABLED, text="Показать")
 
+        self.connected_cameras.clear()
         self.is_recording = False
         self.record_btn.config(text="Записать видео")
         self.recording_label.config(
             text="Запись: Нет", foreground="#3010c2")
-        self.video_control_btn.config(state=tk.DISABLED)
         self.snapshot_btn.config(state=tk.DISABLED)
         self.record_btn.config(state=tk.DISABLED)
+        self.preview_all_btn.config(state=tk.DISABLED, text="Показать все")
 
         if not silent:
             self.log_info("Все камеры отключены")
+            self._refresh_table_statuses()
 
     def refresh_status(self):
         self.log_info("Обновление статуса камер...")
@@ -694,24 +710,67 @@ class CameraDiscoveryApp:
 
     # ============ ОКНА ПРЕВЬЮ ============
     def toggle_preview(self, slot_name):
-        """Открывает или закрывает окно превью для слота."""
         slot = self.slots[slot_name]
         if slot.camera is None:
             return
 
         if slot.preview_window is not None:
-            # Окно открыто — закрываем
             self._close_preview_window(slot)
         else:
-            # Открываем
             self._open_preview_window(slot)
 
+        self._update_preview_all_btn()
+
+    def toggle_all_previews(self):
+        """Открывает все окна, если хотя бы одно закрыто,
+        иначе закрывает все."""
+        # Проверяем, есть ли хотя бы одно открытое
+        any_open = any(s.preview_window is not None
+                       for s in self.slots.values()
+                       if s.camera is not None)
+
+        if any_open:
+            # Закрываем все
+            for slot in self.slots.values():
+                if slot.camera is not None and \
+                        slot.preview_window is not None:
+                    self._close_preview_window(slot)
+            self.log_info("Все окна превью закрыты")
+        else:
+            # Открываем все для слотов с камерой
+            for slot in self.slots.values():
+                if slot.camera is not None and \
+                        slot.preview_window is None:
+                    self._open_preview_window(slot)
+            self.log_info("Все окна превью открыты")
+
+        self._update_preview_all_btn()
+
+    def _update_preview_all_btn(self):
+        """Меняет текст кнопки на «Показать все» или «Скрыть все»
+        в зависимости от того, есть ли открытые окна."""
+        any_open = any(s.preview_window is not None
+                       for s in self.slots.values()
+                       if s.camera is not None)
+        any_camera = any(s.camera is not None
+                         for s in self.slots.values())
+
+        if not any_camera:
+            self.preview_all_btn.config(
+                text="Показать все", state=tk.DISABLED)
+            return
+
+        if any_open:
+            self.preview_all_btn.config(
+                text="Скрыть все", state=tk.NORMAL)
+        else:
+            self.preview_all_btn.config(
+                text="Показать все", state=tk.NORMAL)
+
     def _open_preview_window(self, slot):
-        """Создаёт Toplevel-окно для превью слота."""
         if slot.camera is None:
             return
 
-        # Если окно уже открыто — просто поднять
         if slot.preview_window is not None:
             try:
                 slot.preview_window.lift()
@@ -737,15 +796,29 @@ class CameraDiscoveryApp:
         slot.preview_canvas = canvas
         slot.preview_image_id = None
 
-        # При закрытии окна — останавливаем только рендер
         win.protocol("WM_DELETE_WINDOW",
                      lambda s=slot: self._close_preview_window(s))
+
+        slot.display_enabled = True
+        if not slot.is_streaming:
+            slot.is_streaming = True
+            slot.frame_ready = False
+            slot.frame_size = None
+            slot.frame_count = 0
+            slot.fps_start_time = time.time()
+            slot.current_fps = 0.0
+            slot.thread = Thread(
+                target=self._capture_loop,
+                args=(slot.name,),
+                daemon=True)
+            slot.thread.start()
+
+        if slot.show_btn:
+            slot.show_btn.config(text="Скрыть")
 
         self.log_info(f"[{slot.name}] Окно превью открыто")
 
     def _close_preview_window(self, slot, silent=False):
-        """Закрывает окно превью. Захват и запись продолжаются."""
-        # Убираем картинку с Canvas
         if slot.preview_image_id and slot.preview_canvas:
             try:
                 slot.preview_canvas.delete(slot.preview_image_id)
@@ -760,62 +833,22 @@ class CameraDiscoveryApp:
             except Exception:
                 pass
             slot.preview_window = None
-            if not silent:
-                self.log_info(
-                    f"[{slot.name}] Окно превью закрыто "
-                    f"(запись продолжается)")
+
+        slot.display_enabled = False
+
+        if slot.show_btn:
+            slot.show_btn.config(text="Показать")
+
+        if not silent:
+            self.log_info(
+                f"[{slot.name}] Окно превью закрыто "
+                f"(запись продолжается)")
+
+        # Обновляем текст кнопки «Показать все / Скрыть все»
+        self._update_preview_all_btn()
 
     # ============ ВИДЕО ============
-    def toggle_video(self):
-        if any(s.is_streaming for s in self.slots.values()):
-            self.stop_video_stream()
-        else:
-            self.start_video_stream()
-
-    def start_video_stream(self):
-        any_active = False
-        for slot_name, slot in self.slots.items():
-            if slot.camera is None:
-                continue
-            any_active = True
-            slot.is_streaming = True
-            slot.display_enabled = True
-            slot.frame_ready = False
-            slot.frame_bgr = None
-            slot.frame_size = None
-            slot.frame_count = 0
-            slot.fps_start_time = time.time()
-            slot.current_fps = 0.0
-
-            # Открываем окно превью, если закрыто
-            if slot.preview_window is None:
-                self._open_preview_window(slot)
-
-            # Запускаем поток захвата, если не запущен
-            if slot.thread is None or not slot.thread.is_alive():
-                slot.thread = Thread(
-                    target=self._capture_loop,
-                    args=(slot_name,),
-                    daemon=True)
-                slot.thread.start()
-
-        if any_active:
-            self.video_control_btn.config(text="Остановить видео")
-            self.video_status.config(text="Статус: Видео идет")
-            self.log_info("Запуск видео потока...")
-
-    def stop_video_stream(self):
-        for slot in self.slots.values():
-            slot.is_streaming = False
-            slot.display_enabled = False
-            self._close_preview_window(slot, silent=True)
-
-        self.video_control_btn.config(text="Запустить видео")
-        self.video_status.config(text="Статус: Видео остановлено")
-        self.log_info("Видео поток остановлен")
-
     def _capture_loop(self, slot_name: str):
-        """Фоновый поток захвата для слота. Tkinter не трогает."""
         slot = self.slots[slot_name]
         while slot.is_streaming and slot.camera:
             try:
@@ -835,11 +868,9 @@ class CameraDiscoveryApp:
                     slot.frame_count = 0
                     slot.fps_start_time = now
 
-                # Запись
                 if self.is_recording and slot.recorder:
                     slot.recorder.write_frame(frame)
 
-                # Буфер для превью
                 if slot.display_enabled:
                     if frame.ndim == 2:
                         frame_bgr = cv2.cvtColor(
@@ -860,7 +891,6 @@ class CameraDiscoveryApp:
     def update_ui_loop(self):
         try:
             for slot_name, slot in self.slots.items():
-                # Обновляем FPS-метку всегда
                 if slot.fps_label:
                     if slot.camera is not None:
                         slot.fps_label.config(
@@ -868,7 +898,6 @@ class CameraDiscoveryApp:
                     else:
                         slot.fps_label.config(text="FPS: —")
 
-                # Рендер в окно превью, если оно открыто
                 if not (slot.display_enabled
                         and slot.frame_ready
                         and slot.preview_canvas is not None):
@@ -890,7 +919,6 @@ class CameraDiscoveryApp:
                         slot.frame_ready = True
                     continue
 
-                # Ресайз под размер Canvas
                 h, w = frame_bgr.shape[:2]
                 scale = min(cw / w, ch / h)
                 new_w = max(1, int(w * scale))
@@ -923,7 +951,6 @@ class CameraDiscoveryApp:
                         x, y, anchor=tk.NW, image=imgtk)
                 slot.preview_canvas.image = imgtk
 
-            # Метка записи
             if self.is_recording:
                 parts = []
                 for name, slot in self.slots.items():
@@ -938,7 +965,6 @@ class CameraDiscoveryApp:
                         text="Запись: " + " | ".join(parts),
                         foreground='#ff0000')
 
-            # Индикатор диска
             if (any(s.is_streaming for s in self.slots.values())
                     and time.time() % 2 < 0.05):
                 free_mb = self._free_mb(self._current_record_dir())
@@ -1041,7 +1067,6 @@ class CameraDiscoveryApp:
                 if slot.camera is None:
                     continue
 
-                # Запускаем захват, если не идёт
                 if not slot.is_streaming:
                     slot.is_streaming = True
                     slot.frame_ready = False
@@ -1055,7 +1080,6 @@ class CameraDiscoveryApp:
                         daemon=True)
                     slot.thread.start()
 
-                # Ждём первый кадр
                 start_wait = time.time()
                 while (slot.frame_size is None
                        and time.time() - start_wait < 3.0):
