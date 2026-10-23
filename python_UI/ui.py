@@ -1,59 +1,138 @@
-import re
-import cv2
-from datetime import datetime
+import faulthandler
+import logging
 import os
-from PIL import Image, ImageTk
 import platform
+import queue
+import re
+import signal
 import subprocess
 import sys
-import time
-import signal
 import threading
+import time
 import traceback
 import tkinter as tk
-from tkinter import PhotoImage, ttk, messagebox, filedialog
-from threading import Thread, Lock
+from datetime import datetime
+from threading import Lock, Thread
+from tkinter import PhotoImage, filedialog, messagebox, ttk
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+import cv2
+from PIL import Image, ImageTk
 
-from backend.camera_manager import (
-    CameraScanner, create_camera,
-    VideoRecorder, SegmentingRecorder
-)
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, ROOT_DIR)
+
+from backend import camera_manager as cm  # noqa: E402
+from backend.camera_manager import CameraScanner, create_camera  # noqa: E402
+from backend.config import LOG_DIR, load_settings  # noqa: E402
+from backend.recorder import SegmentedRecorder, free_mb  # noqa: E402
+
+log = logging.getLogger("dashcam.ui")
 
 
-MIN_FREE_MB = 5000
-SEGMENT_DURATION_SEC = 3600
+# ======================================================================
+#  Логирование: один механизм для UI, файла и консоли, потокобезопасный
+# ======================================================================
+class QueueLogHandler(logging.Handler):
+    """Складывает записи в очередь; Tk-виджет читает её из главного потока."""
+
+    def __init__(self, q: "queue.Queue"):
+        super().__init__()
+        self.q = q
+
+    def emit(self, record):
+        try:
+            self.q.put_nowait((record.levelno, self.format(record)))
+        except Exception:
+            pass
 
 
+def setup_logging(log_queue):
+    """Возвращает (file_handler, путь к файлу)."""
+    root = logging.getLogger("dashcam")
+    root.setLevel(logging.INFO)
+    root.propagate = False
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
+                            "%Y-%m-%d %H:%M:%S")
+    file_handler, path = None, None
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        path = os.path.join(
+            LOG_DIR, f"session_{datetime.now():%Y%m%d_%H%M%S}.log")
+        file_handler = logging.FileHandler(path, encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+        # Python-трейсбек при segfault в C-библиотеках (OpenCV, Aravis)
+        faulthandler.enable(file=file_handler.stream, all_threads=True)
+    except Exception as e:
+        print(f"Не удалось открыть файл логов: {e}", file=sys.stderr)
+
+    qh = QueueLogHandler(log_queue)
+    qh.setFormatter(fmt)
+    root.addHandler(qh)
+
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    return file_handler, path
+
+
+def _delete_old_logs(keep: int = 30):
+    try:
+        files = sorted(f for f in os.listdir(LOG_DIR)
+                       if f.startswith("session_") and f.endswith(".log"))
+        for f in files[:-keep]:
+            os.remove(os.path.join(LOG_DIR, f))
+    except Exception:
+        pass
+
+
+# ======================================================================
 class SlotState:
-    """Состояние одного слота (их всего два)."""
+    """Состояние одного слота камеры."""
+
     def __init__(self, name: str):
         self.name = name
         self.camera = None
         self.camera_info = None
-        self.recorder = None
-        self.thread = None
-        self.is_streaming = False
-        self.display_enabled = False
-        self.frame_bgr = None
-        self.frame_ready = False
-        self.frame_lock = Lock()
-        self.current_fps = 0.0
-        self.frame_count = 0
-        self.fps_start_time = time.time()
-        self.frame_size = None
-        self.is_recording = False
-        self.record_dir = None
-        self.segment_paths = []
-        self.recording_start_time = None
 
+        # поток захвата
+        self.thread = None
+        self.stop_evt = threading.Event()
+        self.current_fps = 0.0
+        self.last_frame_time = 0.0
+        self.stalled = False
+        self.frame_size = None          # (w, h)
+        self.frames_total = 0
+
+        # последний кадр (сырой) и кадр для превью
+        self.frame_lock = Lock()
+        self.last_frame = None
+        self.last_frame_ts = 0.0
+        self.preview_img = None
+        self.preview_seq = 0
+        self.rendered_seq = 0
+        self.last_preview_decode = 0.0
+
+        # запись
+        self.rec_lock = Lock()
+        self.arm_pending = False
+        self.record_dir = None
+        self.recorder = None
+
+        # окно превью
         self.preview_window = None
         self.preview_canvas = None
-        self.preview_image_id = None
+        self.photo = None
+        self.photo_key = None
+        self.last_render = 0.0
 
+        # виджеты
         self.slot_info_label = None
         self.fps_label = None
+        self.rec_label = None
         self.show_btn = None
 
 
@@ -61,84 +140,103 @@ class CameraDiscoveryApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Видеорегистратор 3000")
-        self._closing = False
-
-        try:
-            icon = PhotoImage(file="favicon.png")
-            self.root.iconphoto(False, icon)
-        except Exception as e:
-            print(f"Не удалось загрузить иконку: {e}")
-
         self.root.geometry("1100x700")
+        self._closing = False
+        self._busy = False
+        self._stopping = False
+        self._tick = 0
+        self._disk_dialog_shown = False
+        self._widget_cache = {}
 
-        log_dir = os.path.join(os.path.expanduser("~"),
-                               "dash_cam_prom", "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.log_file_path = os.path.join(
-            log_dir, f"session_{session_ts}.log")
-        try:
-            self.log_file = open(self.log_file_path, 'a', encoding='utf-8')
-        except Exception as e:
-            print(f"Не удалось открыть файл логов: {e}")
-            self.log_file = None
+        self.log_queue = queue.Queue()
+        self._events = queue.Queue()      # вызовы для главного потока
+        self.log_file_handler, self.log_file_path = setup_logging(
+            self.log_queue)
+        _delete_old_logs()
 
-        self.slots = {
-            'slot_1': SlotState('slot_1'),
-            'slot_2': SlotState('slot_2'),
-        }
+        self.settings = load_settings()
+
+        icon_path = os.path.join(ROOT_DIR, "favicon.png")
+        if os.path.exists(icon_path):
+            try:
+                self.root.iconphoto(False, PhotoImage(file=icon_path))
+            except Exception as e:
+                log.debug("иконка: %s", e)
+
+        self.slots = {"slot_1": SlotState("slot_1"),
+                      "slot_2": SlotState("slot_2")}
         self.cameras = []
-        self.is_recording = False
         self.connected_cameras = {}
 
         self.create_widgets()
         self.install_crash_handlers()
+        self.install_hotkeys()
 
-        self.root.after(500, self.scan_cameras)
-        self.root.after(30, self.update_ui_loop)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.after(500, lambda: self.scan_cameras(user=False))
+        self.root.after(30, self.update_ui_loop)
 
-        self.log_info(f"Сессия логов: {self.log_file_path}")
+        log.info("Сессия логов: %s", self.log_file_path)
+        if cm.Aravis is None:
+            log.warning("Aravis не найден — GigE-камеры недоступны")
+        else:
+            log.info("Aravis %s", cm.ARAVIS_VERSION)
+        log.info("Кодек: %s, контейнер: %s, сегмент: %d с, мин. место: "
+                 "%d MB", self.settings.encoder, self.settings.container,
+                 self.settings.segment_seconds, self.settings.min_free_mb)
 
-    # ============ АВАРИЙНЫЕ ОБРАБОТЧИКИ ============
+    # ------------------------------------------------------------------
+    #  Вспомогательное
+    # ------------------------------------------------------------------
+    def _post(self, fn):
+        """Выполнить fn в главном потоке (можно вызывать из любого)."""
+        self._events.put(fn)
+
+    def _set(self, widget, **kw):
+        """config() только при изменении — меньше перерисовок."""
+        key = (id(widget), tuple(sorted(kw.items())))
+        if self._widget_cache.get(id(widget)) == key:
+            return
+        self._widget_cache[id(widget)] = key
+        widget.config(**kw)
+
+    def _slot_index(self, slot):
+        return list(self.slots.values()).index(slot) + 1
+
+    def _rec_active(self):
+        return any(s.recorder is not None or s.arm_pending
+                   for s in self.slots.values())
+
+    def _connected_slots(self):
+        return [s for s in self.slots.values() if s.camera is not None]
+
+    # ------------------------------------------------------------------
+    #  Аварийные обработчики
+    # ------------------------------------------------------------------
     def install_crash_handlers(self):
         original_hook = sys.excepthook
 
         def excepthook(exc_type, exc_value, exc_tb):
-            try:
-                self.log_error(
-                    f"НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ: "
-                    f"{exc_type.__name__}: {exc_value}")
-                tb = ''.join(traceback.format_exception(
-                    exc_type, exc_value, exc_tb))
-                self._log_to_file(tb)
-            except Exception:
-                pass
-            finally:
-                self._close_log_file()
-                original_hook(exc_type, exc_value, exc_tb)
+            log.critical("НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ",
+                         exc_info=(exc_type, exc_value, exc_tb))
+            original_hook(exc_type, exc_value, exc_tb)
 
         sys.excepthook = excepthook
 
-        def thread_excepthook(args):
-            try:
-                self.log_error(
-                    f"ИСКЛЮЧЕНИЕ В ПОТОКЕ {args.thread.name}: "
-                    f"{args.exc_type.__name__}: {args.exc_value}")
-                tb = ''.join(traceback.format_exception(
-                    args.exc_type, args.exc_value, args.exc_traceback))
-                self._log_to_file(tb)
-            except Exception:
-                pass
+        def thread_hook(args):
+            log.critical("ИСКЛЮЧЕНИЕ В ПОТОКЕ %s", args.thread.name,
+                         exc_info=(args.exc_type, args.exc_value,
+                                   args.exc_traceback))
 
-        threading.excepthook = thread_excepthook
+        threading.excepthook = thread_hook
+
+        # Исключения в Tk-колбэках иначе уходят только в stderr
+        self.root.report_callback_exception = (
+            lambda et, ev, tb: log.error(
+                "Исключение в обработчике UI", exc_info=(et, ev, tb)))
 
         def signal_handler(signum, frame):
-            try:
-                self.log_warning(
-                    f"Получен сигнал {signum}, завершаю работу...")
-            except Exception:
-                pass
+            log.warning("Получен сигнал %s, завершаю работу...", signum)
             try:
                 self.root.after(0, self.on_closing)
             except Exception:
@@ -148,60 +246,67 @@ class CameraDiscoveryApp:
             signal.signal(signal.SIGINT, signal_handler)
             signal.signal(signal.SIGTERM, signal_handler)
         except Exception as e:
-            print(f"Не удалось установить обработчики сигналов: {e}")
+            log.warning("Обработчики сигналов не установлены: %s", e)
 
-    def _log_to_file(self, message):
-        if self.log_file is not None:
-            try:
-                self.log_file.write(message + "\n")
-                self.log_file.flush()
-            except Exception:
-                pass
+    # ------------------------------------------------------------------
+    #  Горячие клавиши
+    # ------------------------------------------------------------------
+    def install_hotkeys(self):
+        self.root.bind_all("<Key>", self._on_key)
 
-    def _close_log_file(self):
-        if getattr(self, 'log_file', None) is not None:
-            try:
-                self.log_file.close()
-            except Exception:
-                pass
-            self.log_file = None
+    def _on_key(self, event):
+        if isinstance(self.root.focus_get(), (tk.Text, tk.Entry,
+                                              ttk.Entry)):
+            return
+        k = event.keysym
+        if k in ("r", "R", "Cyrillic_ka", "Cyrillic_KA"):
+            self.toggle_recording()
+        elif k in ("s", "S", "Cyrillic_yeru", "Cyrillic_YERU"):
+            self.take_snapshot()
+        elif k == "space":
+            self.toggle_all_previews()
+        elif k in ("l", "L", "Cyrillic_el", "Cyrillic_EL"):
+            self.notebook.select(self.log_tab)
 
-    # ============ ЗАКРЫТИЕ ============
+    # ------------------------------------------------------------------
+    #  Закрытие
+    # ------------------------------------------------------------------
     def on_closing(self):
         if self._closing:
             return
         self._closing = True
+        log.info("Завершение работы...")
 
+        # 1. запись: дописать очередь и закрыть файлы (без диалогов)
         for slot in self.slots.values():
-            slot.is_streaming = False
-            slot.display_enabled = False
+            with slot.rec_lock:
+                slot.arm_pending = False
+                rec, slot.recorder = slot.recorder, None
+            if rec is not None:
+                try:
+                    paths = rec.stop()
+                    log.info("[%s] записано кадров: %d, потеряно: %d, "
+                             "файлов: %d", slot.name, rec.frames_written,
+                             rec.frames_dropped, len(paths))
+                except Exception:
+                    log.exception("остановка записи")
+
+        # 2. камеры
+        for slot in self.slots.values():
             self._close_preview_window(slot, silent=True)
+            self._release_slot(slot)
 
-        try:
-            if self.is_recording:
-                self.stop_recording()
-        except Exception:
-            pass
-        for slot in self.slots.values():
-            try:
-                if slot.camera:
-                    slot.camera.release()
-                    slot.camera = None
-            except Exception:
-                pass
-        try:
-            if self.log_file is not None:
-                self.log_info("Приложение завершает работу, "
-                              "логи сохранены.")
-                self._close_log_file()
-        except Exception:
-            pass
+        self.settings.save()
+        log.info("Приложение завершило работу, логи сохранены.")
         try:
             self.root.destroy()
         except Exception:
             pass
+        logging.shutdown()
 
-    # ============ ИНТЕРФЕЙС ============
+    # ------------------------------------------------------------------
+    #  Виджеты
+    # ------------------------------------------------------------------
     def create_widgets(self):
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -219,112 +324,106 @@ class CameraDiscoveryApp:
         self.create_log_tab()
 
     def create_camera_tab(self):
-        top_frame = ttk.Frame(self.camera_tab, padding="10")
-        top_frame.pack(fill=tk.X)
+        top = ttk.Frame(self.camera_tab, padding="10")
+        top.pack(fill=tk.X)
 
         self.scan_btn = ttk.Button(
-            top_frame, text="Поиск камер",
-            command=self.scan_cameras, width=20)
+            top, text="Поиск камер", width=20,
+            command=lambda: self.scan_cameras(user=True))
         self.scan_btn.pack(side=tk.LEFT, padx=5)
 
         self.connect_btn = ttk.Button(
-            top_frame, text="Подключиться",
-            command=self.connect_camera, width=20, state=tk.DISABLED)
+            top, text="Подключиться", width=20,
+            command=self.connect_camera, state=tk.DISABLED)
         self.connect_btn.pack(side=tk.LEFT, padx=5)
 
         self.disconnect_btn = ttk.Button(
-            top_frame, text="Отключить все",
-            command=self.disconnect_all, width=20)
+            top, text="Отключить все", width=20,
+            command=lambda: self.disconnect_all(user=True))
         self.disconnect_btn.pack(side=tk.LEFT, padx=5)
 
-        self.refresh_btn = ttk.Button(
-            top_frame, text="Обновить статус",
-            command=self.refresh_status, width=20)
-        self.refresh_btn.pack(side=tk.LEFT, padx=5)
-
-        self.loading_label = ttk.Label(top_frame, text="")
+        self.loading_label = ttk.Label(top, text="")
         self.loading_label.pack(side=tk.LEFT, padx=20)
 
-        hint = ttk.Label(
-            self.camera_tab,
+        ttk.Label(
+            self.camera_tab, foreground="#666666", justify=tk.LEFT,
             text="Выберите одну или две камеры (Ctrl+Click). "
                  "Максимум 2 камеры одновременно.\n"
-                 "Для просмотра видео перейдите на вкладку "
-                 "«Управление».",
-            foreground="#666666", justify=tk.LEFT)
-        hint.pack(anchor=tk.W, padx=10, pady=(0, 5))
+                 "Для просмотра видео и записи перейдите на вкладку "
+                 "«Управление»."
+        ).pack(anchor=tk.W, padx=10, pady=(0, 5))
 
-        columns = ('name', 'type', 'serial', 'ip', 'status')
-        self.tree = ttk.Treeview(
-            self.camera_tab, columns=columns,
-            show='headings', height=15,
-            selectmode='extended')
-
+        columns = ("name", "type", "serial", "ip", "status")
         self.status_bar = ttk.Label(
-            self.camera_tab,
-            text="Готов к работе. Нажмите 'Поиск камер'",
-            relief=tk.SUNKEN)
+            self.camera_tab, relief=tk.SUNKEN,
+            text="Готов к работе. Нажмите 'Поиск камер'")
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
 
-        for col, text in zip(
-            columns,
-            ['Имя камеры', 'Тип', 'Серийный номер',
-             'IP-адрес', 'Статус']
-        ):
+        self.tree = ttk.Treeview(self.camera_tab, columns=columns,
+                                 show="headings", height=15,
+                                 selectmode="extended")
+        for col, text in zip(columns, ["Имя камеры", "Тип",
+                                       "Серийный номер", "IP-адрес",
+                                       "Статус"]):
             self.tree.heading(col, text=text)
-            self.tree.column(col, anchor='center')
+            self.tree.column(col, anchor="center")
 
-        scrollbar = ttk.Scrollbar(self.camera_tab, orient=tk.VERTICAL,
-                                  command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
+        sb = ttk.Scrollbar(self.camera_tab, orient=tk.VERTICAL,
+                           command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
                        padx=(10, 0), pady=10)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y,
-                       padx=(0, 10), pady=10)
-
-        self.tree.bind('<<TreeviewSelect>>', self.on_select_camera)
+        sb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=10)
+        self.tree.bind("<<TreeviewSelect>>", self.on_select_camera)
 
     def create_video_tab(self):
-        controls_frame = ttk.Frame(self.video_tab, padding="10")
-        controls_frame.pack(fill=tk.X)
+        controls = ttk.Frame(self.video_tab, padding="10")
+        controls.pack(fill=tk.X)
 
         self.recording_label = ttk.Label(
-            controls_frame, text="Запись: Нет",
-            font=('Arial', 11, 'bold'), foreground="#3010c2")
+            controls, text="Запись: Нет",
+            font=("Arial", 11, "bold"), foreground="#3010c2")
         self.recording_label.pack(side=tk.LEFT, padx=5)
 
         self.disk_label = ttk.Label(
-            controls_frame, text="Диск: —",
-            font=('Arial', 11, 'bold'), foreground="#555555")
+            controls, text="Диск: —",
+            font=("Arial", 11, "bold"), foreground="#555555")
         self.disk_label.pack(side=tk.LEFT, padx=20)
 
         self.record_btn = ttk.Button(
-            controls_frame, text="Записать видео",
-            command=self.toggle_recording, width=18, state=tk.DISABLED)
+            controls, text="Записать видео", width=18,
+            command=self.toggle_recording, state=tk.DISABLED)
         self.record_btn.pack(side=tk.RIGHT, padx=5)
 
         self.snapshot_btn = ttk.Button(
-            controls_frame, text="Снимок",
-            command=self.take_snapshot, width=15, state=tk.DISABLED)
+            controls, text="Снимок", width=15,
+            command=self.take_snapshot, state=tk.DISABLED)
         self.snapshot_btn.pack(side=tk.RIGHT, padx=5)
 
-        # Вторая строка — кнопки «Показать все / Скрыть все»
-        preview_frame = ttk.Frame(self.video_tab, padding="10")
-        preview_frame.pack(fill=tk.X)
+        # Папка записи
+        dir_row = ttk.Frame(self.video_tab, padding=(10, 0))
+        dir_row.pack(fill=tk.X)
+        ttk.Label(dir_row, text="Папка записи:").pack(side=tk.LEFT, padx=5)
+        self.dir_label = ttk.Label(
+            dir_row, foreground="#333333",
+            text=self.settings.last_record_dir or "не выбрана")
+        self.dir_label.pack(side=tk.LEFT, padx=5)
+        self.dir_btn = ttk.Button(dir_row, text="Выбрать…", width=12,
+                                  command=self.choose_record_dir)
+        self.dir_btn.pack(side=tk.LEFT, padx=5)
 
+        # Превью
+        preview = ttk.Frame(self.video_tab, padding="10")
+        preview.pack(fill=tk.X)
         self.preview_all_btn = ttk.Button(
-            preview_frame, text="Показать все",
-            command=self.toggle_all_previews,
-            width=20, state=tk.DISABLED)
+            preview, text="Показать все", width=20,
+            command=self.toggle_all_previews, state=tk.DISABLED)
         self.preview_all_btn.pack(side=tk.LEFT, padx=5)
-
-        self.preview_hint = ttk.Label(
-            preview_frame,
-            text="Открывает / закрывает окна превью для всех "
-                 "подключённых камер",
-            foreground="#666666")
-        self.preview_hint.pack(side=tk.LEFT, padx=10)
+        ttk.Label(
+            preview, foreground="#666666",
+            text="Горячие клавиши: R — запись, S — снимок, "
+                 "Пробел — превью, L — логи"
+        ).pack(side=tk.LEFT, padx=10)
 
         slots_frame = ttk.LabelFrame(
             self.video_tab, text="Подключённые камеры", padding="10")
@@ -334,926 +433,932 @@ class CameraDiscoveryApp:
             row = ttk.Frame(slots_frame)
             row.pack(fill=tk.X, pady=3)
 
-            name_lbl = ttk.Label(
-                row, text=f"Слот {i + 1}: —",
-                font=('Arial', 10, 'bold'), width=45, anchor='w')
-            name_lbl.pack(side=tk.LEFT, padx=5)
-            slot.slot_info_label = name_lbl
+            slot.slot_info_label = ttk.Label(
+                row, text=f"Слот {i + 1}: —", width=40, anchor="w",
+                font=("Arial", 10, "bold"))
+            slot.slot_info_label.pack(side=tk.LEFT, padx=5)
 
-            fps_lbl = ttk.Label(
-                row, text="FPS: —",
-                font=('Arial', 10), width=15, anchor='w')
-            fps_lbl.pack(side=tk.LEFT, padx=5)
-            slot.fps_label = fps_lbl
+            slot.fps_label = ttk.Label(row, text="FPS: —", width=22,
+                                       anchor="w", font=("Arial", 10))
+            slot.fps_label.pack(side=tk.LEFT, padx=5)
 
-            show_btn = ttk.Button(
-                row, text="Показать",
-                command=lambda sn=slot_name: self.toggle_preview(sn),
-                width=15, state=tk.DISABLED)
-            show_btn.pack(side=tk.RIGHT, padx=5)
-            slot.show_btn = show_btn
+            slot.rec_label = ttk.Label(row, text="", anchor="w",
+                                       font=("Arial", 10),
+                                       foreground="#555555")
+            slot.rec_label.pack(side=tk.LEFT, padx=5, fill=tk.X,
+                                expand=True)
+
+            slot.show_btn = ttk.Button(
+                row, text="Показать", width=12, state=tk.DISABLED,
+                command=lambda sn=slot_name: self.toggle_preview(sn))
+            slot.show_btn.pack(side=tk.RIGHT, padx=5)
 
         self.video_status = ttk.Label(
             self.video_tab, text="Статус: Ожидание",
             relief=tk.SUNKEN, anchor=tk.W)
-        self.video_status.pack(side=tk.BOTTOM, fill=tk.X,
-                               padx=10, pady=5)
+        self.video_status.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
 
     def create_log_tab(self):
-        log_controls = ttk.Frame(self.log_tab, padding="5")
-        log_controls.pack(fill=tk.X)
-
-        ttk.Button(log_controls, text="Очистить логи",
+        ctl = ttk.Frame(self.log_tab, padding="5")
+        ctl.pack(fill=tk.X)
+        ttk.Button(ctl, text="Очистить логи",
                    command=self.clear_logs).pack(side=tk.LEFT, padx=5)
-        ttk.Button(log_controls, text="Сохранить логи",
+        ttk.Button(ctl, text="Сохранить логи",
                    command=self.save_logs).pack(side=tk.LEFT, padx=5)
 
-        log_frame = ttk.Frame(self.log_tab)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        self.log_text = tk.Text(
-            log_frame, wrap=tk.WORD, bg='#1e1e1e', fg='white',
-            font=('Consolas', 10), height=20)
-        self.log_text.tag_config('red', foreground='#ff6b6b')
-        self.log_text.tag_config('orange', foreground='#ffa94d')
-        self.log_text.tag_config('green', foreground='#69db7c')
-        self.log_text.tag_config('blue', foreground='#74c0fc')
-
-        log_scrollbar = ttk.Scrollbar(
-            log_frame, orient=tk.VERTICAL,
-            command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        frame = ttk.Frame(self.log_tab)
+        frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.log_text = tk.Text(frame, wrap=tk.WORD, bg="#1e1e1e",
+                                fg="white", font=("Consolas", 10),
+                                height=20)
+        self.log_text.tag_config("red", foreground="#ff6b6b")
+        self.log_text.tag_config("orange", foreground="#ffa94d")
+        self.log_text.tag_config("blue", foreground="#74c0fc")
+        sb = ttk.Scrollbar(frame, orient=tk.VERTICAL,
+                           command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb.set)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-    # ============ ЛОГИ ============
-    def _log(self, message, tag):
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        line = f"[{timestamp}] {message}"
+    # ------------------------------------------------------------------
+    #  Логи в UI
+    # ------------------------------------------------------------------
+    def _drain_log_queue(self):
+        n = 0
         try:
-            self.log_text.insert(tk.END, line + "\n", (tag,))
-            self.log_text.see(tk.END)
-        except Exception:
+            while n < 200:
+                level, line = self.log_queue.get_nowait()
+                tag = ("red" if level >= logging.ERROR else
+                       "orange" if level >= logging.WARNING else "blue")
+                self.log_text.insert(tk.END, line + "\n", (tag,))
+                n += 1
+        except queue.Empty:
             pass
-        self._log_to_file(line)
-
-    def log_info(self, m):
-        self._log(m, 'blue')
-
-    def log_success(self, m):
-        self._log(m, 'green')
-
-    def log_warning(self, m):
-        self._log(f"[WARN] {m}", 'orange')
-
-    def log_error(self, m):
-        self._log(f"[ERROR] {m}", 'red')
+        if n:
+            # не даём окну логов расти бесконечно (сутки записи)
+            if int(float(self.log_text.index("end-1c").split(".")[0])) \
+                    > 5000:
+                self.log_text.delete("1.0", "1000.0")
+            self.log_text.see(tk.END)
 
     def clear_logs(self):
-        self.log_text.delete(1.0, tk.END)
-        self.log_info("Логи очищены")
+        self.log_text.delete("1.0", tk.END)
+        log.info("Окно логов очищено (файл сессии сохранён полностью)")
 
     def save_logs(self):
-        file_path = filedialog.asksaveasfilename(
+        path = filedialog.asksaveasfilename(
             defaultextension=".log",
-            filetypes=[("Log files", "*.log"),
-                       ("Text files", "*.txt"),
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"),
                        ("All files", "*.*")])
-        if file_path:
+        if path:
             try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(self.log_text.get(1.0, tk.END))
-                self.log_success(f"Логи сохранены в {file_path}")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self.log_text.get("1.0", tk.END))
+                log.info("Логи сохранены в %s", path)
             except Exception as e:
-                self.log_error(f"Не удалось сохранить логи: {e}")
+                log.error("Не удалось сохранить логи: %s", e)
 
-    # ============ КАМЕРЫ ============
-    def get_type_display(self, camera_type: str) -> str:
-        return {
-            'aravis': 'GigE', 'gige': 'GigE',
-            'harvester': 'GigE', 'lucid': 'GigE (Lucid)',
-            'hikrobot': 'GigE (Hikrobot)',
-            'usbcam': 'USB', 'unknown': 'Unknown',
-        }.get(camera_type, camera_type.upper())
+    # ------------------------------------------------------------------
+    #  Список камер
+    # ------------------------------------------------------------------
+    @staticmethod
+    def get_type_display(camera_type: str) -> str:
+        return {"aravis": "GigE", "gige": "GigE", "usbcam": "USB",
+                "unknown": "Unknown"}.get(camera_type,
+                                           str(camera_type).upper())
 
-    def _camera_key(self, cam_info):
-        cam_type = cam_info.get('type', 'unknown')
-        if cam_type == 'usbcam':
-            return ('usb', cam_info.get('device_id', 0))
-        serial = cam_info.get('serial')
-        if serial and serial not in ('', 'N/A', 'Unknown'):
-            return ('gige', serial)
-        return ('gige', cam_info.get('ip', 'N/A'))
+    @staticmethod
+    def _camera_key(cam):
+        if cam.get("type") == "usbcam":
+            return ("usb", cam.get("device_id", 0))
+        serial = cam.get("serial")
+        if serial and serial not in ("", "N/A", "Unknown"):
+            return ("gige", serial)
+        return ("gige", cam.get("ip", "N/A"))
 
-    def scan_cameras(self):
-        self.disconnect_all(silent=True)
-
-        self.log_info("Запуск сканирования камер...")
-        self.scan_btn.config(state=tk.DISABLED)
-        self.loading_label.config(text="Поиск камер...")
-        self.status_bar.config(text="Выполняется сканирование камер...")
-
-        Thread(target=self._scan_cameras_thread, daemon=True).start()
-
-    def _scan_cameras_thread(self):
-        try:
-            self.cameras = CameraScanner.scan_all()
-            self.root.after(0, self._update_camera_list)
-            self.log_success(
-                f"Сканирование завершено. Найдено камер: "
-                f"{len(self.cameras)}")
-        except Exception as e:
-            error_msg = f"Ошибка сканирования: {e}"
-            self.log_error(error_msg)
-            self.root.after(0, lambda: self._show_error(error_msg))
-
-    def _update_camera_list(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        if not self.cameras:
-            self.tree.insert('', 'end',
-                             values=('Нет камер', '—', '—', '—', '—'))
-            self.status_bar.config(text="Камеры не найдены")
-            self.log_warning("Камеры не найдены")
-        else:
-            for cam in self.cameras:
-                key = self._camera_key(cam)
-                if key in self.connected_cameras:
-                    status_display = 'Подключена'
-                else:
-                    status_display = {
-                        'Available': 'Доступна',
-                        'Connected': 'Подключена',
-                        'Failed': 'Ошибка'
-                    }.get(cam.get('status', 'Unknown'), 'Неизвестно')
-
-                ip = cam.get('ip', 'N/A') or 'N/A'
-                camera_type = cam.get('type', 'unknown')
-                self.tree.insert(
-                    '', 'end',
-                    values=(cam.get('name', 'Unknown'),
-                            self.get_type_display(camera_type),
-                            cam.get('serial', 'N/A'),
-                            ip,
-                            status_display),
-                    tags=(camera_type,))
-
-            usb_count = sum(1 for c in self.cameras
-                            if c.get('type') == 'usbcam')
-            gige_count = sum(1 for c in self.cameras
-                             if c.get('type') != 'usbcam')
-            parts = []
-            if gige_count:
-                parts.append(f"GigE: {gige_count}")
-            if usb_count:
-                parts.append(f"USB: {usb_count}")
-            self.status_bar.config(
-                text=f"Найдено камер: {len(self.cameras)} "
-                     f"({', '.join(parts)})")
-
-        self.scan_btn.config(state=tk.NORMAL)
-        self.loading_label.config(text="")
-        self.connect_btn.config(state=tk.DISABLED)
-
-    def on_select_camera(self, event):
-        selection = self.tree.selection()
-        if selection:
-            self.connect_btn.config(state=tk.NORMAL)
-            names = [self.tree.item(i, 'values')[0] for i in selection]
-            self.status_bar.config(
-                text=f"Выбрано: {', '.join(names)}")
-        else:
+    def _set_busy(self, busy, text=""):
+        self._busy = busy
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.scan_btn.config(state=state)
+        self.loading_label.config(text=text)
+        if busy:
             self.connect_btn.config(state=tk.DISABLED)
 
-    def _get_free_slots(self):
-        return [name for name, slot in self.slots.items()
-                if slot.camera is None]
+    def scan_cameras(self, user=True):
+        if self._busy or self._closing:
+            return
+        if self._rec_active() or self._stopping:
+            messagebox.showwarning(
+                "Идёт запись",
+                "Поиск камер отключает все камеры. "
+                "Сначала остановите запись.")
+            return
+        if user and self._connected_slots():
+            if not messagebox.askyesno(
+                    "Поиск камер",
+                    "Поиск камер отключит подключённые камеры. "
+                    "Продолжить?"):
+                return
+        self.disconnect_all(silent=True)
 
-    def _is_camera_connected(self, cam_info):
-        key = self._camera_key(cam_info)
-        return key in self.connected_cameras
+        log.info("Запуск сканирования камер...")
+        self._set_busy(True, "Поиск камер...")
+        self.status_bar.config(text="Выполняется сканирование камер...")
+        Thread(target=self._scan_thread, daemon=True,
+               name="scan").start()
 
+    def _scan_thread(self):
+        try:
+            cams = CameraScanner.scan_all()
+            self._post(lambda: self._update_camera_list(cams))
+        except Exception as e:
+            log.exception("Ошибка сканирования")
+            msg = f"Ошибка сканирования: {e}"
+            self._post(lambda: self._scan_failed(msg))
+
+    def _scan_failed(self, msg):
+        self._set_busy(False)
+        self.status_bar.config(text=msg)
+        messagebox.showerror("Ошибка", msg)
+
+    def _update_camera_list(self, cams):
+        self.cameras = cams
+        self.tree.delete(*self.tree.get_children())
+
+        if not cams:
+            self.tree.insert("", "end", iid="none",
+                             values=("Нет камер", "—", "—", "—", "—"))
+            self.status_bar.config(text="Камеры не найдены")
+            log.warning("Камеры не найдены")
+        else:
+            for i, cam in enumerate(cams):
+                self.tree.insert("", "end", iid=str(i), values=(
+                    cam.get("name", "Unknown"),
+                    self.get_type_display(cam.get("type")),
+                    cam.get("serial", "N/A"),
+                    cam.get("ip") or "N/A", "Доступна"))
+            usb = sum(1 for c in cams if c.get("type") == "usbcam")
+            gige = len(cams) - usb
+            parts = ([f"GigE: {gige}"] if gige else []) + \
+                    ([f"USB: {usb}"] if usb else [])
+            self.status_bar.config(
+                text=f"Найдено камер: {len(cams)} ({', '.join(parts)})")
+        self._set_busy(False)
+        self.connect_btn.config(state=tk.DISABLED)
+        log.info("Сканирование завершено. Найдено камер: %d", len(cams))
+
+    def _refresh_table_statuses(self):
+        for iid in self.tree.get_children():
+            if not iid.isdigit() or int(iid) >= len(self.cameras):
+                continue
+            key = self._camera_key(self.cameras[int(iid)])
+            vals = list(self.tree.item(iid, "values"))
+            vals[4] = ("Подключена" if key in self.connected_cameras
+                       else "Доступна")
+            self.tree.item(iid, values=tuple(vals))
+
+    def on_select_camera(self, event):
+        sel = [i for i in self.tree.selection() if i.isdigit()]
+        self.connect_btn.config(
+            state=tk.NORMAL if sel and not self._busy else tk.DISABLED)
+        if sel:
+            names = [self.tree.item(i, "values")[0] for i in sel]
+            self.status_bar.config(text=f"Выбрано: {', '.join(names)}")
+
+    # ------------------------------------------------------------------
+    #  Подключение
+    # ------------------------------------------------------------------
     def connect_camera(self):
-        selection = self.tree.selection()
-        if not selection:
+        if self._busy:
+            return
+        sel = [int(i) for i in self.tree.selection() if i.isdigit()]
+        cams = [self.cameras[i] for i in sel if i < len(self.cameras)]
+        if not cams:
             messagebox.showwarning("Предупреждение",
                                    "Сначала выберите камеру")
             return
 
-        selected_cams = []
-        for item in selection:
-            idx = self.tree.index(item)
-            if idx < len(self.cameras):
-                selected_cams.append(self.cameras[idx])
-
-        if not selected_cams:
+        todo = []
+        for cam in cams:
+            if self._camera_key(cam) in self.connected_cameras:
+                log.warning("%s уже подключена — пропускаю",
+                            cam.get("name"))
+            else:
+                todo.append(cam)
+        if not todo:
+            messagebox.showinfo("Уже подключено",
+                                "Все выбранные камеры уже подключены.")
             return
 
-        cams_to_connect = []
-        for cam in selected_cams:
-            if self._is_camera_connected(cam):
-                self.log_warning(
-                    f"{cam.get('name')} уже подключена — пропускаю")
-                continue
-            cams_to_connect.append(cam)
-
-        if not cams_to_connect:
-            messagebox.showinfo(
-                "Уже подключено",
-                "Все выбранные камеры уже подключены.")
-            return
-
-        free_slots = self._get_free_slots()
-        if len(cams_to_connect) > len(free_slots):
+        free = [n for n, s in self.slots.items() if s.camera is None]
+        if len(todo) > len(free):
             messagebox.showwarning(
                 "Слишком много камер",
-                f"Свободно слотов: {len(free_slots)}. "
-                f"Можно подключить ещё: {len(free_slots)}.\n"
+                f"Свободных слотов: {len(free)}. "
                 f"Максимум 2 камеры одновременно.")
-            cams_to_connect = cams_to_connect[:len(free_slots)]
+            todo = todo[:len(free)]
+        pairs = list(zip(todo, free))
 
-        connected_names = []
-        failed_names = []
+        self._set_busy(True, "Подключение...")
+        Thread(target=self._connect_worker, args=(pairs,),
+               daemon=True, name="connect").start()
 
-        for cam, slot_name in zip(cams_to_connect, free_slots):
-            slot = self.slots[slot_name]
+    def _connect_worker(self, pairs):
+        results = []
+        for cam, slot_name in pairs:
             try:
-                self.log_info(
-                    f"Подключение к {cam['name']} "
-                    f"({self.get_type_display(cam.get('type'))})...")
-                camera_type = cam.get('type', 'aravis')
-                if camera_type == 'usbcam':
-                    new_cam = create_camera(
-                        'usbcam',
-                        device_id=cam.get('device_id', 0))
+                log.info("Подключение к %s (%s)...", cam["name"],
+                         self.get_type_display(cam.get("type")))
+                if cam.get("type") == "usbcam":
+                    new = create_camera("usbcam", self.settings,
+                                        device_id=cam.get("device_id", 0))
                 else:
-                    new_cam = create_camera(
-                        'aravis',
-                        device_id=cam.get('device_id', 0),
-                        saved_ip=cam.get('_saved_ip'),
-                        pixel_format="Mono8")
-
-                slot.camera = new_cam
-                slot.camera_info = cam
-
-                key = self._camera_key(cam)
-                self.connected_cameras[key] = slot_name
-
-                cam_name = cam.get('name', 'Unknown')
-                cam_type = self.get_type_display(camera_type)
-                self._update_slot_label(
-                    slot, f"Слот {list(self.slots.keys()).index(slot_name) + 1}: "
-                          f"{cam_type} — {cam_name}")
-
-                slot.show_btn.config(state=tk.NORMAL)
-
-                self.log_success(
-                    f"Подключено: {cam_name} → {slot_name}")
-                connected_names.append(cam_name)
-
+                    new = create_camera("aravis", self.settings,
+                                        arv_id=cam.get("arv_id"),
+                                        pixel_format="Mono8")
+                results.append((cam, slot_name, new, None))
             except Exception as e:
-                self.log_error(
-                    f"Не удалось подключить {cam['name']}: {e}")
-                failed_names.append(cam['name'])
+                log.error("Не удалось подключить %s: %s", cam["name"], e)
+                results.append((cam, slot_name, None, e))
+        self._post(lambda: self._on_connected(results))
 
-        self._refresh_table_statuses()
-
-        any_active = any(s.camera is not None
-                         for s in self.slots.values())
-        if any_active:
-            self.snapshot_btn.config(state=tk.NORMAL)
-            self.record_btn.config(state=tk.NORMAL)
-            self.preview_all_btn.config(state=tk.NORMAL)
-            self._update_preview_all_btn()
-
-        if connected_names:
-            msg = "Успешно подключено:\n  • " + "\n  • ".join(connected_names)
-            msg += ("\n\nДля просмотра видео перейдите на вкладку "
-                    "«Управление» и нажмите «Показать все» "
-                    "или «Показать» напротив нужной камеры.")
-            if failed_names:
-                msg += ("\n\nНе удалось подключить:\n  • "
-                        + "\n  • ".join(failed_names))
-            messagebox.showinfo("Подключение", msg)
-
-    def _refresh_table_statuses(self):
-        for item in self.tree.get_children():
-            values = self.tree.item(item, 'values')
-            if not values:
+    def _on_connected(self, results):
+        ok, failed = [], []
+        for cam, slot_name, new_cam, err in results:
+            if new_cam is None:
+                failed.append(cam["name"])
                 continue
-            cam_name = values[0]
-            for cam in self.cameras:
-                if cam.get('name') == cam_name:
-                    key = self._camera_key(cam)
-                    new_values = list(values)
-                    if key in self.connected_cameras:
-                        new_values[4] = 'Подключена'
-                    else:
-                        if values[4] == 'Подключена':
-                            new_values[4] = 'Доступна'
-                    self.tree.item(item, values=tuple(new_values))
-                    break
+            if self._closing:
+                new_cam.release()
+                continue
+            slot = self.slots[slot_name]
+            slot.camera = new_cam
+            slot.camera_info = cam
+            self.connected_cameras[self._camera_key(cam)] = slot_name
 
-    def _update_slot_label(self, slot, text):
-        if slot.slot_info_label:
-            slot.slot_info_label.config(text=text)
+            kind = {"mjpeg_raw": "MJPG без перекодирования",
+                    "gray": "Mono8", "bgr": "BGR"}.get(
+                        new_cam.frame_kind, "")
+            slot.slot_info_label.config(
+                text=f"Слот {self._slot_index(slot)}: "
+                     f"{self.get_type_display(cam.get('type'))} — "
+                     f"{cam.get('name')}")
+            slot.show_btn.config(state=tk.NORMAL)
+            self._start_capture(slot)
+            log.info("Подключено: %s → %s (%s)", cam.get("name"),
+                     slot_name, kind)
+            ok.append(cam.get("name"))
 
-    def disconnect_all(self, silent=False):
-        for slot_name, slot in self.slots.items():
-            if slot.recorder is not None:
-                try:
-                    slot.recorder.stop()
-                except Exception:
-                    pass
-                slot.recorder = None
-                slot.is_recording = False
+        self._set_busy(False)
+        self._refresh_table_statuses()
+        self._refresh_controls()
 
-            slot.is_streaming = False
-            slot.display_enabled = False
+        if ok:
+            msg = "Успешно подключено:\n  • " + "\n  • ".join(ok)
+            if failed:
+                msg += ("\n\nНе удалось подключить:\n  • "
+                        + "\n  • ".join(failed))
+            messagebox.showinfo("Подключение", msg)
+        elif failed:
+            messagebox.showerror(
+                "Ошибка подключения",
+                "Не удалось подключить:\n  • " + "\n  • ".join(failed)
+                + "\n\nПодробности — на вкладке «Логи».")
 
-            self._close_preview_window(slot, silent=silent)
+    def _release_slot(self, slot):
+        """Останавливает захват и освобождает камеру (безопасный порядок)."""
+        slot.stop_evt.set()
+        t = slot.thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=5.0)
+            if t.is_alive():
+                # release() под работающим get_frame() — это segfault.
+                # Лучше оставить камеру открытой, чем уронить процесс.
+                log.error("[%s] поток захвата не остановился — камера "
+                          "не освобождается", slot.name)
+                return
+        slot.thread = None
+        cam, slot.camera = slot.camera, None
+        if cam is not None:
+            try:
+                stats = cam.get_stats()
+                if stats:
+                    log.info("[%s] статистика потока: %s", slot.name, stats)
+                cam.release()
+            except Exception as e:
+                log.error("Ошибка освобождения %s: %s", slot.name, e)
+        slot.camera_info = None
+        slot.last_frame = None
+        slot.preview_img = None
+        slot.current_fps = 0.0
 
-            if slot.camera is not None:
-                try:
-                    slot.camera.release()
-                except Exception as e:
-                    if not silent:
-                        self.log_error(
-                            f"Ошибка освобождения {slot.name}: {e}")
-                slot.camera = None
-            slot.camera_info = None
-
-            idx = list(self.slots.keys()).index(slot_name)
-            self._update_slot_label(slot, f"Слот {idx + 1}: —")
-            if slot.fps_label:
-                slot.fps_label.config(text="FPS: —")
-            if slot.show_btn:
-                slot.show_btn.config(state=tk.DISABLED, text="Показать")
-
+    def disconnect_all(self, silent=False, user=False):
+        if user and (self._rec_active() or self._stopping):
+            if not messagebox.askyesno(
+                    "Идёт запись",
+                    "Остановить запись и отключить камеры?"):
+                return
+        self._stop_all_recorders(sync=True)
+        for slot in self.slots.values():
+            self._close_preview_window(slot, silent=True)
+            self._release_slot(slot)
+            idx = self._slot_index(slot)
+            slot.slot_info_label.config(text=f"Слот {idx}: —")
+            slot.fps_label.config(text="FPS: —")
+            slot.rec_label.config(text="")
+            slot.show_btn.config(state=tk.DISABLED, text="Показать")
         self.connected_cameras.clear()
-        self.is_recording = False
-        self.record_btn.config(text="Записать видео")
-        self.recording_label.config(
-            text="Запись: Нет", foreground="#3010c2")
-        self.snapshot_btn.config(state=tk.DISABLED)
-        self.record_btn.config(state=tk.DISABLED)
-        self.preview_all_btn.config(state=tk.DISABLED, text="Показать все")
-
+        self._refresh_controls()
         if not silent:
-            self.log_info("Все камеры отключены")
+            log.info("Все камеры отключены")
             self._refresh_table_statuses()
 
-    def refresh_status(self):
-        self.log_info("Обновление статуса камер...")
-        self.scan_cameras()
+    # ------------------------------------------------------------------
+    #  Поток захвата
+    # ------------------------------------------------------------------
+    def _start_capture(self, slot):
+        slot.stop_evt = threading.Event()
+        slot.frame_size = None
+        slot.current_fps = 0.0
+        slot.frames_total = 0
+        slot.stalled = False
+        slot.last_frame_time = time.time()
+        slot.thread = Thread(
+            target=self._capture_loop,
+            args=(slot, slot.camera, slot.stop_evt),
+            name=f"capture-{slot.name}", daemon=True)
+        slot.thread.start()
 
-    # ============ ОКНА ПРЕВЬЮ ============
+    def _capture_loop(self, slot, cam, stop):
+        """
+        Единственный потребитель кадров камеры. Здесь же:
+        подсчёт FPS, подготовка превью, передача кадра рекордеру.
+        Tk-виджетов не трогает.
+        """
+        s = self.settings
+        fps_t0, fps_n = time.time(), 0
+        errors = 0
+        warm, warm_n, warm_t0 = [], 0, None
+        max_warm = max(1, s.queue_frames - 8)
+        raw = cam.frame_kind == "mjpeg_raw"
+
+        while not stop.is_set():
+            try:
+                frame = cam.get_frame(200)
+                errors = 0
+            except Exception:
+                errors += 1
+                log.exception("[%s] ошибка get_frame", slot.name)
+                if errors >= 20:
+                    log.error("[%s] захват остановлен после 20 ошибок "
+                              "подряд", slot.name)
+                    break
+                time.sleep(0.2)
+                continue
+
+            now = time.time()
+            if frame is None:
+                if not slot.stalled and now - slot.last_frame_time > 3.0:
+                    slot.stalled = True
+                    log.warning("[%s] нет кадров от камеры более 3 с",
+                                slot.name)
+                continue
+
+            if slot.stalled:
+                slot.stalled = False
+                log.info("[%s] кадры снова поступают", slot.name)
+            slot.last_frame_time = now
+            slot.frames_total += 1
+
+            if slot.frame_size is None:
+                if raw:
+                    info = cam.get_info()
+                    slot.frame_size = (info["width"], info["height"])
+                else:
+                    slot.frame_size = (frame.shape[1], frame.shape[0])
+
+            fps_n += 1
+            if now - fps_t0 >= 1.0:
+                slot.current_fps = fps_n / (now - fps_t0)
+                fps_n, fps_t0 = 0, now
+
+            with slot.frame_lock:
+                slot.last_frame = frame
+                slot.last_frame_ts = now
+
+            # ---- превью: декодируем/копируем не чаще preview_fps ----
+            if (slot.preview_window is not None and
+                    now - slot.last_preview_decode >= 1.0 / s.preview_fps):
+                slot.last_preview_decode = now
+                try:
+                    img = cam.to_image(frame)
+                except Exception:
+                    img = None
+                if img is not None:
+                    with slot.frame_lock:
+                        slot.preview_img = img
+                        slot.preview_seq += 1
+
+            # ---- запись ----
+            rec = slot.recorder
+            if rec is not None:
+                rec.submit(frame, now)
+                warm, warm_n, warm_t0 = [], 0, None
+            elif slot.arm_pending:
+                # Меряем реальный FPS ~1 с, чтобы записать его в файл.
+                # Эти кадры не теряем — уйдут в рекордер первыми.
+                if warm_t0 is None:
+                    warm_t0, warm, warm_n = now, [], 0
+                warm_n += 1
+                if len(warm) < max_warm:
+                    warm.append((frame, now))
+                if now - warm_t0 >= s.warmup_seconds and warm_n >= 3:
+                    fps = (warm_n - 1) / (now - warm_t0)
+                    self._start_slot_recorder(slot, cam, frame, fps, warm)
+                    warm, warm_n, warm_t0 = [], 0, None
+            else:
+                warm, warm_n, warm_t0 = [], 0, None
+
+        log.info("[%s] поток захвата завершён", slot.name)
+
+    def _start_slot_recorder(self, slot, cam, frame, fps, warm):
+        """Вызывается из потока захвата."""
+        s = self.settings
+        with slot.rec_lock:
+            if not slot.arm_pending:
+                return
+            slot.arm_pending = False
+            raw = cam.frame_kind == "mjpeg_raw"
+            w, h = slot.frame_size
+            is_color = raw or frame.ndim == 3
+            name = ((slot.camera_info or {}).get("name", slot.name)
+                    + "_" + slot.name)
+            fps = min(120.0, max(1.0, round(fps, 2)))
+            try:
+                rec = SegmentedRecorder(
+                    slot.record_dir, name, w, h, fps, is_color,
+                    source="mjpeg_raw" if raw else "raw",
+                    codec="ffv1" if s.encoder == "ffv1" else "mjpeg",
+                    min_free_mb=s.min_free_mb,
+                    segment_seconds=s.segment_seconds,
+                    quality=s.jpeg_quality, container=s.container,
+                    queue_frames=s.queue_frames,
+                    write_csv=s.write_timestamps,
+                    reencode=(raw and s.encoder != "auto"),
+                    on_disk_full=lambda free, sl=slot:
+                        self._post(lambda: self._handle_disk_full(sl, free)),
+                    on_error=lambda msg, sl=slot:
+                        self._post(lambda: self._handle_rec_error(sl, msg)))
+                rec.start()
+            except Exception as e:
+                log.error("[%s] не удалось начать запись: %s", slot.name, e)
+                msg = str(e)
+                self._post(lambda: self._handle_start_failed(slot, msg))
+                return
+            for f, ts in warm:
+                rec.submit(f, ts)
+            slot.recorder = rec
+        log.info("[%s] запись начата: %s", slot.name, rec.segment_paths[-1])
+
+    # ------------------------------------------------------------------
+    #  Превью
+    # ------------------------------------------------------------------
     def toggle_preview(self, slot_name):
         slot = self.slots[slot_name]
         if slot.camera is None:
             return
-
         if slot.preview_window is not None:
             self._close_preview_window(slot)
         else:
             self._open_preview_window(slot)
 
-        self._update_preview_all_btn()
-
     def toggle_all_previews(self):
-        """Открывает все окна, если хотя бы одно закрыто,
-        иначе закрывает все."""
-        # Проверяем, есть ли хотя бы одно открытое
-        any_open = any(s.preview_window is not None
-                       for s in self.slots.values()
-                       if s.camera is not None)
-
-        if any_open:
-            # Закрываем все
-            for slot in self.slots.values():
-                if slot.camera is not None and \
-                        slot.preview_window is not None:
-                    self._close_preview_window(slot)
-            self.log_info("Все окна превью закрыты")
-        else:
-            # Открываем все для слотов с камерой
-            for slot in self.slots.values():
-                if slot.camera is not None and \
-                        slot.preview_window is None:
-                    self._open_preview_window(slot)
-            self.log_info("Все окна превью открыты")
-
-        self._update_preview_all_btn()
-
-    def _update_preview_all_btn(self):
-        """Меняет текст кнопки на «Показать все» или «Скрыть все»
-        в зависимости от того, есть ли открытые окна."""
-        any_open = any(s.preview_window is not None
-                       for s in self.slots.values()
-                       if s.camera is not None)
-        any_camera = any(s.camera is not None
-                         for s in self.slots.values())
-
-        if not any_camera:
-            self.preview_all_btn.config(
-                text="Показать все", state=tk.DISABLED)
+        active = self._connected_slots()
+        if not active:
             return
-
-        if any_open:
-            self.preview_all_btn.config(
-                text="Скрыть все", state=tk.NORMAL)
+        if any(s.preview_window is not None for s in active):
+            for s in active:
+                self._close_preview_window(s, silent=True)
+            log.info("Все окна превью закрыты")
         else:
-            self.preview_all_btn.config(
-                text="Показать все", state=tk.NORMAL)
+            for s in active:
+                self._open_preview_window(s)
+            log.info("Все окна превью открыты")
 
     def _open_preview_window(self, slot):
         if slot.camera is None:
             return
-
         if slot.preview_window is not None:
-            try:
-                slot.preview_window.lift()
-                slot.preview_window.focus_force()
-            except Exception:
-                pass
+            slot.preview_window.lift()
             return
-
-        cam_info = slot.camera_info or {}
-        cam_name = cam_info.get('name', slot.name)
-        cam_type = self.get_type_display(cam_info.get('type', 'unknown'))
-
+        info = slot.camera_info or {}
         win = tk.Toplevel(self.root)
-        win.title(f"{cam_type}: {cam_name}")
+        win.title(f"{self.get_type_display(info.get('type'))}: "
+                  f"{info.get('name', slot.name)}")
         win.geometry("900x650")
         win.minsize(320, 240)
-
-        canvas = tk.Canvas(win, background='black',
-                           highlightthickness=0)
+        canvas = tk.Canvas(win, background="black", highlightthickness=0)
         canvas.pack(fill=tk.BOTH, expand=True)
-
-        slot.preview_window = win
-        slot.preview_canvas = canvas
-        slot.preview_image_id = None
-
+        canvas.create_text(12, 12, anchor=tk.NW, text="● REC", tags="rec",
+                           fill="#ff3b30", font=("Arial", 16, "bold"),
+                           state="hidden")
+        win.bind("<Key>", self._on_key)
         win.protocol("WM_DELETE_WINDOW",
                      lambda s=slot: self._close_preview_window(s))
-
-        slot.display_enabled = True
-        if not slot.is_streaming:
-            slot.is_streaming = True
-            slot.frame_ready = False
-            slot.frame_size = None
-            slot.frame_count = 0
-            slot.fps_start_time = time.time()
-            slot.current_fps = 0.0
-            slot.thread = Thread(
-                target=self._capture_loop,
-                args=(slot.name,),
-                daemon=True)
-            slot.thread.start()
-
-        if slot.show_btn:
-            slot.show_btn.config(text="Скрыть")
-
-        self.log_info(f"[{slot.name}] Окно превью открыто")
+        slot.preview_window = win
+        slot.preview_canvas = canvas
+        slot.photo = None
+        slot.photo_key = None
+        slot.rendered_seq = -1
+        slot.show_btn.config(text="Скрыть")
+        log.info("[%s] окно превью открыто", slot.name)
 
     def _close_preview_window(self, slot, silent=False):
-        if slot.preview_image_id and slot.preview_canvas:
-            try:
-                slot.preview_canvas.delete(slot.preview_image_id)
-            except Exception:
-                pass
-        slot.preview_image_id = None
+        win = slot.preview_window
+        slot.preview_window = None
         slot.preview_canvas = None
-
-        if slot.preview_window is not None:
+        slot.photo = None
+        slot.photo_key = None
+        if win is not None:
             try:
-                slot.preview_window.destroy()
+                win.destroy()
             except Exception:
                 pass
-            slot.preview_window = None
-
-        slot.display_enabled = False
-
-        if slot.show_btn:
+            if not silent:
+                log.info("[%s] окно превью закрыто (запись продолжается)",
+                         slot.name)
+        if slot.show_btn is not None and slot.camera is not None:
             slot.show_btn.config(text="Показать")
 
-        if not silent:
-            self.log_info(
-                f"[{slot.name}] Окно превью закрыто "
-                f"(запись продолжается)")
+    def _render_preview(self, slot, now):
+        canvas = slot.preview_canvas
+        if canvas is None:
+            return
+        if now - slot.last_render < 1.0 / self.settings.preview_fps:
+            return
+        with slot.frame_lock:
+            img = slot.preview_img
+            seq = slot.preview_seq
+        if img is None or seq == slot.rendered_seq:
+            canvas.itemconfigure(
+                "rec", state="normal" if slot.recorder else "hidden")
+            return
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        slot.rendered_seq = seq
+        slot.last_render = now
 
-        # Обновляем текст кнопки «Показать все / Скрыть все»
-        self._update_preview_all_btn()
+        h, w = img.shape[:2]
+        scale = min(cw / w, ch / h)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        if (nw, nh) != (w, h):
+            # ужимаем ДО конвертации цвета: в 3 раза меньше данных для Mono8
+            img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        if img.ndim == 3:
+            pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        else:
+            pil = Image.fromarray(img)
 
-    # ============ ВИДЕО ============
-    def _capture_loop(self, slot_name: str):
-        slot = self.slots[slot_name]
-        while slot.is_streaming and slot.camera:
+        key = (pil.size, pil.mode)
+        x, y = (cw - nw) // 2, (ch - nh) // 2
+        if slot.photo is not None and slot.photo_key == key:
+            slot.photo.paste(pil)          # без пересоздания PhotoImage
+            canvas.coords("frame", x, y)
+        else:
+            canvas.delete("frame")
+            slot.photo = ImageTk.PhotoImage(pil)
+            slot.photo_key = key
+            canvas.create_image(x, y, anchor=tk.NW, image=slot.photo,
+                                tags="frame")
+            canvas.tag_raise("rec")
+        canvas.itemconfigure(
+            "rec", state="normal" if slot.recorder else "hidden")
+
+    # ------------------------------------------------------------------
+    #  Цикл обновления UI
+    # ------------------------------------------------------------------
+    def _drain_events(self):
+        for _ in range(50):
             try:
-                frame = slot.camera.get_frame()
-                if frame is None:
-                    time.sleep(0.001)
-                    continue
-
-                if slot.frame_size is None:
-                    slot.frame_size = (frame.shape[1], frame.shape[0])
-
-                slot.frame_count += 1
-                now = time.time()
-                if now - slot.fps_start_time >= 0.5:
-                    slot.current_fps = (
-                        slot.frame_count / (now - slot.fps_start_time))
-                    slot.frame_count = 0
-                    slot.fps_start_time = now
-
-                if self.is_recording and slot.recorder:
-                    slot.recorder.write_frame(frame)
-
-                if slot.display_enabled:
-                    if frame.ndim == 2:
-                        frame_bgr = cv2.cvtColor(
-                            frame, cv2.COLOR_GRAY2BGR)
-                    else:
-                        frame_bgr = frame.copy()
-
-                    with slot.frame_lock:
-                        slot.frame_bgr = frame_bgr
-                        slot.frame_ready = True
-
-            except Exception as e:
-                if slot.is_streaming:
-                    self.log_error(
-                        f"[{slot_name}] Ошибка захвата: {e}")
-                break
+                fn = self._events.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception:
+                log.exception("событие UI")
 
     def update_ui_loop(self):
         try:
-            for slot_name, slot in self.slots.items():
-                if slot.fps_label:
-                    if slot.camera is not None:
-                        slot.fps_label.config(
-                            text=f"FPS: {slot.current_fps:.1f}")
-                    else:
-                        slot.fps_label.config(text="FPS: —")
+            self._drain_events()
+            self._drain_log_queue()
+            now = time.time()
+            for slot in self.slots.values():
+                self._render_preview(slot, now)
 
-                if not (slot.display_enabled
-                        and slot.frame_ready
-                        and slot.preview_canvas is not None):
-                    continue
-
-                with slot.frame_lock:
-                    frame_bgr = slot.frame_bgr
-                    slot.frame_ready = False
-
-                if frame_bgr is None:
-                    continue
-
-                cw = slot.preview_canvas.winfo_width()
-                ch = slot.preview_canvas.winfo_height()
-
-                if cw <= 1 or ch <= 1:
-                    with slot.frame_lock:
-                        slot.frame_bgr = frame_bgr
-                        slot.frame_ready = True
-                    continue
-
-                h, w = frame_bgr.shape[:2]
-                scale = min(cw / w, ch / h)
-                new_w = max(1, int(w * scale))
-                new_h = max(1, int(h * scale))
-                if new_w != w or new_h != h:
-                    frame_resized = cv2.resize(
-                        frame_bgr, (new_w, new_h),
-                        interpolation=cv2.INTER_AREA)
-                else:
-                    frame_resized = frame_bgr
-
-                frame_rgb = cv2.cvtColor(
-                    frame_resized, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(frame_rgb)
-                imgtk = ImageTk.PhotoImage(image=img)
-
-                if slot.preview_image_id:
-                    try:
-                        slot.preview_canvas.delete(
-                            slot.preview_image_id)
-                    except Exception:
-                        pass
-                    slot.preview_image_id = None
-
-                iw, ih = imgtk.width(), imgtk.height()
-                x = max(0, (cw - iw) // 2)
-                y = max(0, (ch - ih) // 2)
-                slot.preview_image_id = \
-                    slot.preview_canvas.create_image(
-                        x, y, anchor=tk.NW, image=imgtk)
-                slot.preview_canvas.image = imgtk
-
-            if self.is_recording:
-                parts = []
-                for name, slot in self.slots.items():
-                    if slot.recorder:
-                        idx = slot.recorder.get_segment_count()
-                        rem = slot.recorder.get_segment_remaining()
-                        parts.append(
-                            f"{name}: сегм.{idx}, "
-                            f"{int(rem // 60)} мин")
-                if parts:
-                    self.recording_label.config(
-                        text="Запись: " + " | ".join(parts),
-                        foreground='#ff0000')
-
-            if (any(s.is_streaming for s in self.slots.values())
-                    and time.time() % 2 < 0.05):
-                free_mb = self._free_mb(self._current_record_dir())
-                self._update_disk_label(free_mb)
-
-        except Exception as e:
-            print(f"UI loop error: {e}")
-
+            self._tick += 1
+            if self._tick % 15 == 0:          # ~2 раза в секунду
+                self._refresh_labels()
+            if self._tick % 60 == 0:          # ~раз в 2 секунды
+                self._update_disk_label()
+        except Exception:
+            log.exception("Ошибка в цикле UI")
         if not self._closing:
             self.root.after(30, self.update_ui_loop)
 
-    # ============ ЗАПИСЬ ============
+    def _refresh_labels(self):
+        for slot in self.slots.values():
+            if slot.camera is None:
+                continue
+            fps = f"FPS: {slot.current_fps:.1f}"
+            if slot.stalled:
+                fps += "  (нет кадров!)"
+            self._set(slot.fps_label, text=fps)
+
+            rec = slot.recorder
+            if rec is not None:
+                text = (f"сегм. {rec.segment_index}, "
+                        f"{int(rec.segment_remaining // 60)} мин до смены | "
+                        f"записано {rec.frames_written}, "
+                        f"очередь {rec.queue_size}")
+                lost = rec.frames_dropped + rec.frames_corrupt
+                if lost:
+                    text += f" | ПОТЕРЯНО {lost}"
+                self._set(slot.rec_label, text=text,
+                          foreground="#cc0000" if lost else "#007700")
+            elif slot.arm_pending:
+                self._set(slot.rec_label, text="подготовка записи...",
+                          foreground="#555555")
+            else:
+                self._set(slot.rec_label, text="", foreground="#555555")
+        self._refresh_controls()
+
+    def _refresh_controls(self):
+        active = self._connected_slots()
+        has = bool(active)
+        rec_on = self._rec_active()
+
+        self._set(self.snapshot_btn,
+                  state=tk.NORMAL if has else tk.DISABLED)
+        self._set(self.record_btn,
+                  state=(tk.DISABLED if (not has or self._stopping)
+                         else tk.NORMAL),
+                  text=("Остановка..." if self._stopping else
+                        "Остановить запись" if rec_on else
+                        "Записать видео"))
+        any_open = any(s.preview_window is not None for s in active)
+        self._set(self.preview_all_btn,
+                  state=tk.NORMAL if has else tk.DISABLED,
+                  text="Скрыть все" if any_open else "Показать все")
+        self._set(self.dir_btn,
+              state=tk.DISABLED if rec_on else tk.NORMAL)
+
+        if rec_on:
+            n = sum(1 for s in self.slots.values() if s.recorder)
+            self._set(self.recording_label,
+                      text=(f"Запись: ИДЁТ ({n} кам.)" if n
+                            else "Запись: подготовка..."),
+                      foreground="#ff0000")
+            self._set(self.video_status,
+                      text=f"Статус: запись идёт ({n} кам.)")
+        else:
+            self._set(self.recording_label, text="Запись: Нет",
+                      foreground="#3010c2")
+
+    # ------------------------------------------------------------------
+    #  Диск и папка записи
+    # ------------------------------------------------------------------
+    def choose_record_dir(self):
+        path = filedialog.askdirectory(
+            title="Папка для записи видео",
+            initialdir=self.settings.last_record_dir or os.path.expanduser(
+                "~"))
+        if path:
+            self.settings.last_record_dir = path
+            self.settings.save()
+            self.dir_label.config(text=path)
+            self._update_disk_label()
+        return bool(path)
+
+    def _update_disk_label(self):
+        path = self.settings.last_record_dir or os.path.expanduser("~")
+        mb = free_mb(path)
+        lim = self.settings.min_free_mb
+        if mb == float("inf"):
+            self._set(self.disk_label, text="Диск: —",
+                      foreground="#555555")
+        elif mb < lim:
+            self._set(self.disk_label, text=f"Диск: {mb:.0f} MB (мало!)",
+                      foreground="#ff0000")
+        elif mb < lim * 3:
+            self._set(self.disk_label, text=f"Диск: {mb:.0f} MB",
+                      foreground="#ff8800")
+        else:
+            self._set(self.disk_label, text=f"Диск: {mb:.0f} MB",
+                      foreground="#007700")
+
+    # ------------------------------------------------------------------
+    #  Запись
+    # ------------------------------------------------------------------
     def toggle_recording(self):
-        if self.is_recording:
+        if self._stopping:
+            return
+        if self._rec_active():
             self.stop_recording()
         else:
             self.start_recording()
 
-    def _current_record_dir(self):
-        for slot in self.slots.values():
-            if slot.recorder and slot.recorder.output_dir:
-                return slot.recorder.output_dir
-        return os.path.expanduser("~")
-
-    def _free_mb(self, path):
-        try:
-            st = os.statvfs(path)
-            return (st.f_bavail * st.f_frsize) / (1024 * 1024)
-        except Exception:
-            return float('inf')
-
-    def _update_disk_label(self, free_mb):
-        if free_mb == float('inf'):
-            self.disk_label.config(text="Диск: —",
-                                   foreground="#555555")
-            return
-        if free_mb < MIN_FREE_MB:
-            self.disk_label.config(
-                text=f"Диск: {free_mb:.0f} MB (мало!)",
-                foreground="#ff0000")
-        elif free_mb < MIN_FREE_MB * 3:
-            self.disk_label.config(
-                text=f"Диск: {free_mb:.0f} MB",
-                foreground="#ff8800")
-        else:
-            self.disk_label.config(
-                text=f"Диск: {free_mb:.0f} MB",
-                foreground="#007700")
-
-    def _on_disk_full(self, free_mb):
-        self.root.after(0, lambda: self._handle_disk_full(free_mb))
-
-    def _handle_disk_full(self, free_mb):
-        if not self.is_recording:
-            return
-        self.log_error(
-            f"Мало места на диске ({free_mb:.0f} MB). "
-            f"Запись остановлена автоматически.")
-        self.stop_recording()
-        messagebox.showwarning(
-            "Диск заполнен",
-            f"Свободное место меньше {MIN_FREE_MB} MB.\n"
-            f"Запись автоматически остановлена.")
-
-    def _on_segment_change(self, slot_name, index, path):
-        self.root.after(
-            0, lambda: self._handle_segment_change(
-                slot_name, index, path))
-
-    def _handle_segment_change(self, slot_name, index, path):
-        self.log_info(f"[{slot_name}] Новый сегмент {index}: {path}")
-
     def start_recording(self):
-        active = [s for s in self.slots.values() if s.camera]
+        active = self._connected_slots()
         if not active:
             messagebox.showwarning("Предупреждение",
                                    "Сначала подключитесь к камере")
             return
-        if self.is_recording:
+        if not self.settings.last_record_dir or \
+                not os.path.isdir(self.settings.last_record_dir):
+            if not self.choose_record_dir():
+                return
+        rdir = self.settings.last_record_dir
+
+        free = free_mb(rdir)
+        if free < self.settings.min_free_mb:
+            messagebox.showerror(
+                "Мало места",
+                f"Свободно всего {free:.0f} MB.\n"
+                f"Нужно минимум {self.settings.min_free_mb} MB.")
+            return
+        if not os.access(rdir, os.W_OK):
+            messagebox.showerror("Ошибка",
+                                 f"Нет прав на запись в {rdir}")
             return
 
-        try:
-            recordings_dir = filedialog.askdirectory(
-                title="Укажите директорию для сохранения видео")
-            if not recordings_dir:
-                return
-
-            free_mb = self._free_mb(recordings_dir)
-            if free_mb < MIN_FREE_MB:
-                messagebox.showerror(
-                    "Мало места",
-                    f"Свободно всего {free_mb:.0f} MB.\n"
-                    f"Нужно минимум {MIN_FREE_MB} MB.")
-                return
-
-            self.log_info("Инициализация записи...")
-
-            started = 0
-            for slot_name, slot in self.slots.items():
-                if slot.camera is None:
-                    continue
-
-                if not slot.is_streaming:
-                    slot.is_streaming = True
-                    slot.frame_ready = False
-                    slot.frame_size = None
-                    slot.frame_count = 0
-                    slot.fps_start_time = time.time()
-                    slot.current_fps = 0.0
-                    slot.thread = Thread(
-                        target=self._capture_loop,
-                        args=(slot_name,),
-                        daemon=True)
-                    slot.thread.start()
-
-                start_wait = time.time()
-                while (slot.frame_size is None
-                       and time.time() - start_wait < 3.0):
-                    time.sleep(0.02)
-
-                if slot.frame_size is None:
-                    self.log_error(
-                        f"[{slot_name}] Не удалось определить размер")
-                    continue
-
-                first_frame = slot.camera.get_frame()
-                if first_frame is None:
-                    self.log_error(
-                        f"[{slot_name}] Камера не отдаёт кадры")
-                    continue
-
-                is_color = (first_frame.ndim == 3)
-                width, height = slot.frame_size
-                target_fps = (int(slot.current_fps)
-                              if slot.current_fps >= 5 else 30)
-                cam_name = (slot.camera_info or {}).get(
-                    'name', slot_name)
-
-                slot.record_dir = recordings_dir
-                slot.segment_paths = []
-                slot.recorder = SegmentingRecorder(
-                    output_dir=recordings_dir,
-                    fps=target_fps,
-                    is_color=is_color,
-                    min_free_mb=MIN_FREE_MB,
-                    on_disk_full=self._on_disk_full,
-                    segment_seconds=SEGMENT_DURATION_SEC,
-                    camera_name=f"{cam_name}_{slot_name}",
-                    on_segment_change=lambda i, p, n=slot_name:
-                        self._on_segment_change(n, i, p)
-                )
-
-                if not slot.recorder.start(width, height):
-                    self.log_error(
-                        f"[{slot_name}] Не удалось начать сегмент")
-                    slot.recorder = None
-                    continue
-
-                slot.is_recording = True
-                slot.recording_start_time = time.time()
-                started += 1
-                self.log_success(
-                    f"[{slot_name}] Запись начата: "
-                    f"{slot.recorder.get_segment_paths()[-1]}")
-
-            if started == 0:
-                self.is_recording = False
-                self.record_btn.config(text="Записать видео")
-                self.recording_label.config(
-                    text="Запись: Нет",
-                    foreground="#3010c2")
-                messagebox.showerror("Ошибка",
-                                     "Не удалось начать запись")
-                return
-
-            self.is_recording = True
-            self.record_btn.config(text="Остановить запись")
-            self.recording_label.config(
-                text=f"Запись: ИДЕТ ({started} кам.)",
-                foreground='#ff0000')
-            self.video_status.config(
-                text=f"Статус: Запись идет ({started} камер)")
-
-        except Exception as e:
-            self.log_error(f"Ошибка начала записи: {e}")
-            messagebox.showerror(
-                "Ошибка", f"Не удалось начать запись: {e}")
+        self._disk_dialog_shown = False
+        log.info("Запись → %s (кодек: %s, контейнер: %s)", rdir,
+                 self.settings.encoder, self.settings.container)
+        for slot in active:
+            slot.record_dir = rdir
+            slot.arm_pending = True       # поток захвата сам начнёт запись
+        self._refresh_controls()
 
     def stop_recording(self):
-        if not self.is_recording:
-            return
-        try:
-            total_paths = []
-            for slot_name, slot in self.slots.items():
-                if slot.recorder is None:
-                    continue
+        self._stop_all_recorders(sync=False, interactive=True)
+
+    def _detach(self, slot):
+        with slot.rec_lock:
+            slot.arm_pending = False
+            rec, slot.recorder = slot.recorder, None
+        return rec
+
+    def _stop_all_recorders(self, sync, interactive=False):
+        pairs = []
+        for slot in self.slots.values():
+            rec = self._detach(slot)
+            if rec is not None:
+                pairs.append((slot, rec))
+        if pairs:
+            self._finish_recorders(pairs, sync, interactive)
+
+    def _finish_recorders(self, pairs, sync, interactive=False):
+        def work():
+            res = []
+            for slot, rec in pairs:
                 try:
-                    paths = slot.recorder.stop()
-                    total_paths.extend(paths)
-                    self.log_success(
-                        f"[{slot_name}] Запись остановлена, "
-                        f"сегментов: {len(paths)}")
-                    for p in paths:
-                        self.log_info(f"  [{slot_name}] {p}")
-                except Exception as e:
-                    self.log_error(
-                        f"[{slot_name}] Ошибка остановки: {e}")
-                finally:
-                    slot.recorder = None
-                    slot.is_recording = False
-                    slot.recording_start_time = None
-
-            self.is_recording = False
-            self.record_btn.config(text="Записать видео")
-            self.recording_label.config(
-                text="Запись: Нет", foreground="#3010c2")
-
-            if total_paths:
-                self.video_status.config(
-                    text=f"Статус: Записано файлов: "
-                         f"{len(total_paths)}")
-                first_dir = os.path.dirname(total_paths[0])
-                if messagebox.askyesno(
-                    "Запись завершена",
-                    f"Всего файлов: {len(total_paths)}\n\n"
-                    f"Папка: {first_dir}\n\n"
-                    f"Открыть папку?"
-                ):
-                    if platform.system() == 'Windows':
-                        os.startfile(first_dir)
-                    elif platform.system() == 'Darwin':
-                        subprocess.Popen(['open', first_dir])
-                    else:
-                        subprocess.Popen(['xdg-open', first_dir])
+                    res.append((slot, rec, rec.stop()))
+                except Exception:
+                    log.exception("остановка записи %s", slot.name)
+            if sync:
+                self._report_stopped(res, False)
             else:
-                self.log_warning("Запись не была сохранена")
-                self.video_status.config(
-                    text="Статус: Запись не сохранена")
+                self._post(lambda: self._on_stopped(res, interactive))
 
+        if sync:
+            work()
+        else:
+            self._stopping = True
+            self._refresh_controls()
+            Thread(target=work, daemon=True, name="stop-rec").start()
+
+    def _report_stopped(self, res, _interactive):
+        paths = []
+        for slot, rec, p in res:
+            paths.extend(p)
+            log.info("[%s] запись остановлена: сегментов %d, кадров %d, "
+                     "потеряно (очередь) %d, битых JPEG %d", slot.name,
+                     len(p), rec.frames_written, rec.frames_dropped,
+                     rec.frames_corrupt)
+            for f in p:
+                log.info("  %s", f)
+        return paths
+
+    def _on_stopped(self, res, interactive):
+        self._stopping = False
+        paths = self._report_stopped(res, interactive)
+        self._refresh_controls()
+        if not paths:
+            self.video_status.config(text="Статус: запись не сохранена")
+            return
+        self.video_status.config(
+            text=f"Статус: записано файлов: {len(paths)}")
+        lost = sum(r.frames_dropped + r.frames_corrupt for _, r, _ in res)
+        if interactive and not self._closing:
+            folder = os.path.dirname(paths[0])
+            msg = f"Всего файлов: {len(paths)}\nПапка: {folder}\n"
+            if lost:
+                msg += (f"\nВНИМАНИЕ: потеряно кадров: {lost} "
+                        f"(см. логи).\n")
+            if messagebox.askyesno("Запись завершена",
+                                   msg + "\nОткрыть папку?"):
+                self._open_folder(folder)
+
+    @staticmethod
+    def _open_folder(path):
+        try:
+            if platform.system() == "Windows":
+                os.startfile(path)
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
         except Exception as e:
-            self.log_error(f"Ошибка остановки записи: {e}")
-            messagebox.showerror(
-                "Ошибка", f"Не удалось остановить запись: {e}")
-            self.is_recording = False
-            self.record_btn.config(text="Записать видео")
-            self.recording_label.config(
-                text="Запись: Нет", foreground="#3010c2")
+            log.error("Не удалось открыть папку: %s", e)
 
-    # ============ СНИМОК ============
+    def _handle_start_failed(self, slot, msg):
+        self._refresh_controls()
+        messagebox.showerror(
+            "Ошибка записи",
+            f"[{slot.name}] не удалось начать запись:\n{msg}")
+
+    def _handle_rec_error(self, slot, msg):
+        rec = self._detach(slot)
+        if rec is not None:
+            self._finish_recorders([(slot, rec)], sync=False)
+        messagebox.showerror(
+            "Ошибка записи",
+            f"[{slot.name}] запись остановлена:\n{msg}")
+
+    def _handle_disk_full(self, slot, free):
+        rec = self._detach(slot)
+        if rec is not None:
+            self._finish_recorders([(slot, rec)], sync=False)
+        if not self._disk_dialog_shown:
+            self._disk_dialog_shown = True
+            messagebox.showwarning(
+                "Диск заполнен",
+                f"Свободное место меньше {self.settings.min_free_mb} MB "
+                f"({free:.0f} MB).\nЗапись остановлена автоматически.")
+
+    # ------------------------------------------------------------------
+    #  Снимок
+    # ------------------------------------------------------------------
     def take_snapshot(self):
-        any_active = any(s.camera for s in self.slots.values())
-        if not any_active:
+        active = self._connected_slots()
+        if not active:
             messagebox.showwarning("Предупреждение",
                                    "Камера не подключена")
             return
+        base = self.settings.last_record_dir or os.path.join(
+            os.path.expanduser("~"), "dash_cam_prom")
+        snap_dir = os.path.join(base, "snapshots")
         try:
-            snapshots_dir = filedialog.askdirectory(
-                title="Выберите каталог для сохранения снимков")
-            if not snapshots_dir:
-                return
-
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            saved = 0
-            for slot_name, slot in self.slots.items():
-                if slot.camera is None:
-                    continue
-                frame = slot.camera.get_frame()
-                if frame is None:
-                    continue
-                cam_name = (slot.camera_info or {}).get(
-                    'name', slot_name)
-                safe = re.sub(r'[^\w\-_\. ]', '_', cam_name)
-                filepath = os.path.join(
-                    snapshots_dir,
-                    f"{safe}_{slot_name}_{timestamp}.png")
-                cv2.imwrite(filepath, frame)
-                self.log_success(f"Снимок сохранён: {filepath}")
-                saved += 1
-
-            if saved == 0:
-                self.log_warning("Не удалось получить кадр для снимка")
+            os.makedirs(snap_dir, exist_ok=True)
         except Exception as e:
-            self.log_error(f"Ошибка при сохранении снимка: {e}")
+            log.error("Не удалось создать %s: %s", snap_dir, e)
+            return
 
-    def _show_error(self, error_message):
-        self.scan_btn.config(state=tk.NORMAL)
-        self.loading_label.config(text="")
-        self.status_bar.config(text=f"Ошибка: {error_message}")
-        messagebox.showerror("Ошибка", error_message)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        jobs = []
+        for slot in active:
+            with slot.frame_lock:
+                frame = slot.last_frame
+            if frame is None:
+                continue
+            name = re.sub(r"[^\w\-_.]+", "_",
+                          (slot.camera_info or {}).get("name", slot.name))
+            jobs.append((slot.camera, frame,
+                         os.path.join(snap_dir,
+                                      f"{name}_{slot.name}_{ts}")))
+        if not jobs:
+            log.warning("Нет кадров для снимка")
+            return
+
+        def work():
+            for cam, frame, stem in jobs:
+                try:
+                    if cam.frame_kind == "mjpeg_raw":
+                        # исходный JPEG камеры без пережатия
+                        path = stem + ".jpg"
+                        with open(path, "wb") as f:
+                            f.write(frame.tobytes())
+                    else:
+                        path = stem + ".png"
+                        cv2.imwrite(path, frame,
+                                    [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                    log.info("Снимок сохранён: %s", path)
+                except Exception as e:
+                    log.error("Ошибка сохранения снимка: %s", e)
+
+        Thread(target=work, daemon=True, name="snapshot").start()
 
 
 def main():
@@ -1262,14 +1367,12 @@ def main():
     try:
         root.mainloop()
     except KeyboardInterrupt:
-        app.log_warning("Прервано пользователем (Ctrl+C)")
+        log.warning("Прервано пользователем (Ctrl+C)")
         app.on_closing()
-    except Exception as e:
-        app.log_error(f"Критическая ошибка в mainloop: {e}")
-        app._log_to_file(traceback.format_exc())
+    except Exception:
+        log.critical("Критическая ошибка в mainloop: %s",
+                     traceback.format_exc())
         app.on_closing()
-    finally:
-        app._close_log_file()
 
 
 if __name__ == "__main__":

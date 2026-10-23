@@ -33,13 +33,11 @@ env/
 *.jpg
 *.jpeg
 *.PNG
-*.png
-*.jpg
-*.jpeg
 recordings/frames/
 *.log
 
-# Сохраняем структуру папок
+# Сохраняем структуру папок и иконку
+!favicon.png
 !recordings/.gitkeep
 !snapshots/.gitkeep
 
@@ -69,7 +67,7 @@ Thumbs.db
 # ============================================
 *.db
 *.sqlite
-persist.json  # Если содержит чувствительные данные
+persist.json
 
 # ============================================
 # MSYS2 / Windows

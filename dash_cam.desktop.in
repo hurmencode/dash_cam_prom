@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Видеорегистратор 3000
+Exec=@APP_DIR@/run.sh
+Icon=@APP_DIR@/favicon.png
+Terminal=false
+Categories=Utility;Video;

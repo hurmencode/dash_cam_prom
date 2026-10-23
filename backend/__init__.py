@@ -1,29 +1,22 @@
 """
-Backend module for Dash Cam Prom
-Содержит логику работы с камерами и обработку данных
+Backend Dash Cam Prom: камеры, запись, настройки.
 """
 
-# Экспортируем основные классы и функции для удобного импорта
+from .config import Settings, load_settings
 from .camera_manager import (
     CameraInterface,
     UsbCameraManager,
     ArvCameraManager,
     CameraScanner,
-    create_camera
+    create_camera,
 )
+from .recorder import SegmentedRecorder, free_mb
 
-# Определяем, что экспортируется при импорте *
 __all__ = [
-    'CameraInterface',
-    'UsbCameraManager', 
-    'ArvCameraManager',
-    'CameraScanner',
-    'create_camera'
+    "Settings", "load_settings",
+    "CameraInterface", "UsbCameraManager", "ArvCameraManager",
+    "CameraScanner", "create_camera",
+    "SegmentedRecorder", "free_mb",
 ]
 
-# Версия модуля (опционально)
-__version__ = '1.0.0'
-
-# Информация о модуле
-__author__ = 'Your Name'
-__description__ = 'Camera management backend for Dash Cam Prom'
+__version__ = "2.0.0"

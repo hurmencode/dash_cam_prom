@@ -1,9 +1,17 @@
 #!/bin/bash
-cd "$(dirname "$0")"
+# Запуск Видеорегистратора 3000 (Jetson / Linux)
+cd "$(dirname "$0")" || exit 1
 
-# Пути к Aravis, собранному из исходников
-export GI_TYPELIB_PATH="/usr/local/lib/aarch64-linux-gnu/girepository-1.0:$GI_TYPELIB_PATH"
-export LD_LIBRARY_PATH="/usr/local/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH"
+# Aravis, собранный из исходников (если собирали в /usr/local).
+# С пакетным gir1.2-aravis-0.8 эти пути не нужны.
+for d in /usr/local/lib/aarch64-linux-gnu /usr/local/lib/x86_64-linux-gnu; do
+    if [ -d "$d/girepository-1.0" ]; then
+        export GI_TYPELIB_PATH="$d/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+        export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+done
 
-source .venv/bin/activate
-python python_UI/ui.py
+# venv создаётся с --system-site-packages (см. README)
+[ -f .venv/bin/activate ] && source .venv/bin/activate
+
+exec python3 python_UI/ui.py "$@"

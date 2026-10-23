@@ -1,0 +1,20 @@
+{
+  "min_free_mb": 5000,
+  "segment_seconds": 3600,
+  "encoder": "auto",
+  "jpeg_quality": 95,
+  "container": "mkv",
+  "queue_frames": 64,
+  "warmup_seconds": 1.0,
+  "write_timestamps": true,
+  "preview_fps": 15,
+  "gige_buffers": 32,
+  "gige_target_fps": null,
+  "usb_width": null,
+  "usb_height": null,
+  "usb_fps": null,
+  "usb_use_mjpg": true,
+  "usb_passthrough": true,
+  "last_record_dir": "/media/granit/VIDEO",
+  "last_snapshot_dir": ""
+}

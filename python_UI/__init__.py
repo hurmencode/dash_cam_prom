@@ -1,20 +1,9 @@
 """
-Python UI module for Dash Cam Prom
-Содержит графический интерфейс пользователя
+GUI Dash Cam Prom.
+
+Пакет намеренно не импортирует ui.py при импорте: так не требуется
+tkinter, например в тестах или при запуске backend отдельно.
+Запуск: python3 python_UI/ui.py  (или ./run.sh)
 """
 
-# Экспортируем основной класс приложения
-from .ui import CameraDiscoveryApp, main
-
-# Определяем, что экспортируется при импорте *
-__all__ = [
-    'CameraDiscoveryApp',
-    'main'
-]
-
-# Версия модуля (опционально)
-__version__ = '1.0.0'
-
-# Информация о модуле
-__author__ = 'Your Name'
-__description__ = 'GUI for Dash Cam Prom'
+__version__ = "2.0.0"

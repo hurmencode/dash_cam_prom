@@ -1,84 +1,34 @@
 # ============================================================
-#  dash_cam_prom — requirements.txt
+#  dash_cam_prom — зависимости
 # ============================================================
 #
-#  ВАЖНО: этот файл предполагает использование venv с флагом
-#  --system-site-packages. На Linux/Jetson (Ubuntu 22.04/24.04,
-#  Jetson Orin Nano) основные зависимости (OpenCV, NumPy, Pillow,
-#  PyGObject, Aravis) должны быть установлены через apt, а НЕ
-#  через pip. Иначе получишь конфликты и падения записи MJPG.
-#
-#  Правильная последовательность установки на Linux:
+#  На Jetson (JetPack 6 = Ubuntu 22.04, Python 3.10) всё, кроме Pillow,
+#  ставится через apt, а НЕ через pip:
 #
 #    sudo apt update
 #    sudo apt install -y \
-#        python3-gi python3-gi-cairo gir1.2-aravis-0.10 \
-#        libaravis-0.10-0 arv-tools \
-#        python3-opencv python3-pil python3-numpy
+#        python3-gi python3-gi-cairo gir1.2-aravis-0.8 arv-tools \
+#        python3-opencv python3-numpy python3-pil python3-tk \
+#        v4l-utils ffmpeg
 #
 #    python3 -m venv --system-site-packages .venv
 #    source .venv/bin/activate
 #    pip install -r requirements.txt
 #
-#  Для Windows/MSYS2 — см. README, раздел «Установка».
+#  Почему не pip-версии:
+#   * pip-пакет opencv-python на aarch64 собран без Jetson-специфики и
+#     может конфликтовать с системным python3-opencv из JetPack;
+#   * PyGObject (gi) и Aravis через pip не ставятся вообще.
+#
+#  ffmpeg нужен для режимов записи «как есть» (MJPG от USB-камеры)
+#  и FFV1 (lossless). Для обычного MJPG через OpenCV не нужен.
 # ============================================================
 
+# Минимальные версии; при --system-site-packages уже установленные
+# apt-пакеты удовлетворяют этим требованиям и pip их не трогает.
+Pillow>=9.0.0
+numpy>=1.21.0
 
-# ------------------------------------------------------------
-# Pillow — отображение кадров в Tkinter через ImageTk.
-# На Linux идёт из apt как python3-pil. pip-версия совместима,
-# но в venv с --system-site-packages устанавливать не нужно.
-# ------------------------------------------------------------
-Pillow>=10.0.0
-
-
-# ------------------------------------------------------------
-# NumPy — работа с кадрами Aravis (np.frombuffer, reshape).
-# На Linux идёт из apt как python3-numpy. pip-версия совместима,
-# но не требуется при --system-site-packages.
-# ------------------------------------------------------------
-numpy>=1.24.0
-
-
-# ------------------------------------------------------------
-# OpenCV — захват и запись видео (VideoWriter, MJPG, resize,
-# cvtColor, putText). На Linux идёт из apt как python3-opencv.
-#
-# ВНИМАНИЕ: pip-пакет opencv-python НЕ РЕКОМЕНДУЕТСЯ на Jetson:
-#   - он собран без Jetson-специфичных бэкендов,
-#   - у него другой FFmpeg, из-за чего MJPG-запись ломается,
-#   - cv2.getBuildInformation() покажет FFMPEG: NO, GSTREAMER: NO.
-#
-# Если системного python3-opencv нет — раскомментируй строку ниже
-# ТОЛЬКО для обычного x86_64 Ubuntu, не для Jetson.
-# ------------------------------------------------------------
-# opencv-python>=4.8.0
-
-
-# ------------------------------------------------------------
-# PyGObject (gi) — не ставится через pip без головной боли:
-# нужны libgirepository1.0-dev, libcairo2-dev, компилятор.
-# На Linux ставится через apt как python3-gi.
-# В requirements.txt отсутствует намеренно.
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# Aravis — C-библиотека с GObject Introspection.
-# Через pip не устанавливается.
-#   Linux:   apt install gir1.2-aravis-0.10 libaravis-0.10-0 arv-tools
-#   MSYS2:   pacman -S mingw-w64-x86_64-aravis
-# Сборка из исходников — см. README, раздел «Сборка Aravis».
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# Опциональные зависимости (не требуются для базовой работы)
-# ------------------------------------------------------------
-
-# Для диагностики производительности Aravis через ARV_DEBUG=stream
-# ничего дополнительно не нужно — всё встроено в библиотеку.
-
-# Для конвертации записанных MJPG-файлов в H.264 через ffmpeg
-# (пост-обработка, не входит в само приложение):
-# ffmpeg (устанавливается через apt/brew/choco, не через pip)
+# OpenCV — только системный (python3-opencv).
+# Для обычного x86_64 Ubuntu, если системного нет, можно:
+# opencv-python-headless>=4.5.0
