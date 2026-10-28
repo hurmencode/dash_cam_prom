@@ -24,7 +24,8 @@ sys.path.insert(0, ROOT_DIR)
 from backend import camera_manager as cm  # noqa: E402
 from backend.camera_manager import CameraScanner, create_camera  # noqa: E402
 from backend.config import LOG_DIR, load_settings  # noqa: E402
-from backend.recorder import SegmentedRecorder, free_mb  # noqa: E402
+from backend.recorder import (  # noqa: E402
+    SegmentedRecorder, ffmpeg_selftest, free_mb, set_ffmpeg_path)
 
 log = logging.getLogger("dashcam.ui")
 
@@ -155,6 +156,7 @@ class CameraDiscoveryApp:
         _delete_old_logs()
 
         self.settings = load_settings()
+        set_ffmpeg_path(self.settings.ffmpeg_path)
 
         icon_path = os.path.join(ROOT_DIR, "favicon.png")
         if os.path.exists(icon_path):
@@ -181,6 +183,11 @@ class CameraDiscoveryApp:
             log.warning("Aravis не найден — GigE-камеры недоступны")
         else:
             log.info("Aravis %s", cm.ARAVIS_VERSION)
+        # Проверка ffmpeg в фоне: проблему видно в логе сразу, а не в
+        # момент начала записи.
+        Thread(target=lambda: [ffmpeg_selftest("copy_mjpeg", True),
+                               ffmpeg_selftest("mjpeg", False)],
+               daemon=True, name="ffmpeg-check").start()
         log.info("Кодек: %s, контейнер: %s, сегмент: %d с, мин. место: "
                  "%d MB", self.settings.encoder, self.settings.container,
                  self.settings.segment_seconds, self.settings.min_free_mb)

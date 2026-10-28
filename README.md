@@ -141,6 +141,7 @@ JPEG). Потери на самой камере/в сети/USB в нумера
 | `container` | `mkv` | `mkv` или `avi` (mkv устойчивее к обрыву питания) |
 | `segment_seconds` | `3600` | длина сегмента |
 | `min_free_mb` | `5000` | ниже порога запись останавливается |
+| `ffmpeg_path` | пусто | путь к ffmpeg, если нужен не из PATH (`DASHCAM_FFMPEG_PATH`) |
 | `queue_frames` | `64` | буфер между захватом и кодированием |
 | `write_timestamps` | `true` | CSV с временем кадров |
 | `preview_fps` | `15` | предел частоты обновления превью |
@@ -203,6 +204,15 @@ sudo sysctl -w net.core.netdev_max_backlog=5000
 
 ## 🩺 Диагностика
 
+- `python3 tools/check_ffmpeg.py` — какие режимы записи ffmpeg тянет.
+  Приложение рассчитано и на урезанные сборки Jetson (`--disable-everything`,
+  без swscale, протоколы только `file,pipe`): вход идёт через `pipe:0`, JPEG
+  копируются демультиплексором `mjpeg`, а формат пикселей готовится в Python.
+- В логе `ffmpeg ... НЕ работает в режиме ...` — ffmpeg урезан (нет `image2pipe` или
+  протокола `pipe`). Запись при этом идёт через OpenCV (USB-кадры
+  перекодируются). Лечится: `sudo apt install --reinstall ffmpeg` или
+  `DASHCAM_FFMPEG_PATH=/путь/к/нормальному/ffmpeg`.
+
 - `tools/check_aravis.py` — видит ли Aravis камеры.
 - В логе при отключении GigE-камеры выводится статистика потока Aravis
   (`completed`, `failures`, `underruns`). `failures` — потерянные/битые
@@ -229,7 +239,7 @@ dash_cam_prom/
 │   ├── recorder.py         # очередь + поток записи, сегменты, ffmpeg/MJPG/FFV1
 │   └── config.py           # настройки
 ├── python_UI/ui.py         # Tkinter-приложение
-├── tools/                  # check_aravis.py, check_usb_camera.py, bench_encoder.py
+├── tools/                  # check_aravis.py, check_ffmpeg.py, check_usb_camera.py, bench_encoder.py
 ├── run.sh, install_desktop.sh
 └── requirements.txt
 ```

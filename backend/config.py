@@ -34,6 +34,7 @@ class Settings:
     container: str = "mkv"            # mkv устойчивее к обрыву питания, чем avi
     queue_frames: int = 64            # буфер между захватом и кодированием
     warmup_seconds: float = 1.0       # измерение реального FPS перед записью
+    ffmpeg_path: str = ""             # путь к ffmpeg, если не из PATH
     write_timestamps: bool = True     # CSV с номером и временем каждого кадра
 
     # --- превью ---

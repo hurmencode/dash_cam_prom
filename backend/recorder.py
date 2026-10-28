@@ -40,8 +40,18 @@ import numpy as np
 log = logging.getLogger("dashcam.recorder")
 
 
+_ffmpeg_override: Optional[str] = None
+
+
+def set_ffmpeg_path(path: Optional[str]):
+    """Явный путь к ffmpeg (настройка ffmpeg_path / DASHCAM_FFMPEG)."""
+    global _ffmpeg_override
+    _ffmpeg_override = path or None
+    _selftest_cache.clear()
+
+
 def ffmpeg_path() -> Optional[str]:
-    return shutil.which("ffmpeg")
+    return _ffmpeg_override or shutil.which("ffmpeg")
 
 
 def free_mb(path: str) -> float:
@@ -76,34 +86,63 @@ class FfmpegWriter:
     Пишет кадры в stdin процесса ffmpeg.
     kind: 'copy_mjpeg' | 'mjpeg' | 'ffv1'
     Для copy_mjpeg в write() передаётся массив с байтами JPEG-кадра.
+
+    Рассчитано на урезанные сборки ffmpeg (Jetson: --disable-everything,
+    --disable-swscale, протоколы только file,pipe), поэтому:
+    * вход задаётся как pipe:0 (в ffmpeg 8 «-» превращается в fd:, а
+      протокола fd в такой сборке нет);
+    * для копирования JPEG используется демультиплексор mjpeg, а не
+      image2pipe;
+    * ffmpeg НИЧЕГО не конвертирует: формат пикселей приводится к тому,
+      что кодек принимает напрямую, здесь, в Python (иначе нужен swscale):
+        mjpeg: Mono8 -> yuvj420p (серый + нейтральный цвет),
+               BGR -> yuvj420p (cv2, полный диапазон)
+        ffv1:  Mono8 -> gray, BGR -> bgr0 (с пустым альфа-каналом)
     """
 
     def __init__(self, path: str, fps: float, size: Tuple[int, int],
                  is_color: bool, kind: str, quality: int = 95,
-                 threads: int = 0):
+                 threads: int = 0, quiet: bool = False):
+        self.quiet = quiet
+        self.returncode = None
+        self._conv = None
         w, h = size
         cmd = [ffmpeg_path(), "-hide_banner", "-loglevel", "warning",
                "-y"]
         if kind == "copy_mjpeg":
-            cmd += ["-f", "image2pipe", "-c:v", "mjpeg",
-                    "-framerate", f"{fps:.3f}", "-i", "-", "-c:v", "copy"]
-        else:
-            pix = "bgr24" if is_color else "gray"
-            cmd += ["-f", "rawvideo", "-pix_fmt", pix, "-s", f"{w}x{h}",
-                    "-framerate", f"{fps:.3f}", "-i", "-"]
-            if kind == "ffv1":
-                cmd += ["-c:v", "ffv1", "-level", "3", "-coder", "1",
-                        "-context", "1", "-g", "1", "-slices", "16",
-                        "-slicecrc", "1"]
-                if is_color:
-                    cmd += ["-pix_fmt", "bgr0"]
-                else:
-                    cmd += ["-pix_fmt", "gray"]
+            cmd += ["-f", "mjpeg", "-framerate", f"{fps:.3f}",
+                    "-i", "pipe:0", "-c:v", "copy"]
+        elif kind == "ffv1":
+            if is_color:
+                in_pix = "bgr0"
+                self._conv = lambda f: cv2.cvtColor(f, cv2.COLOR_BGR2BGRA)
             else:
-                cmd += ["-c:v", "mjpeg", "-q:v", str(_jpeg_qv(quality)),
-                        "-pix_fmt", "yuvj444p" if is_color else "yuvj420p"]
-            if threads:
-                cmd += ["-threads", str(threads)]
+                in_pix = "gray"
+            cmd += ["-f", "rawvideo", "-pix_fmt", in_pix,
+                    "-s", f"{w}x{h}", "-framerate", f"{fps:.3f}",
+                    "-i", "pipe:0",
+                    "-c:v", "ffv1", "-level", "3", "-coder", "1",
+                    "-context", "1", "-g", "1", "-slices", "16",
+                    "-slicecrc", "1"]
+        else:  # mjpeg
+            ew, eh = w & ~1, h & ~1          # yuv420: чётные размеры
+            if is_color:
+                self._conv = lambda f: cv2.cvtColor(
+                    np.ascontiguousarray(f[:eh, :ew]),
+                    cv2.COLOR_BGR2YUV_I420)
+            else:
+                buf = np.full((eh * 3 // 2, ew), 128, np.uint8)
+
+                def conv(f, buf=buf, eh=eh, ew=ew):
+                    buf[:eh] = f[:eh, :ew]   # плоскость Y; U/V = 128
+                    return buf
+                self._conv = conv
+            cmd += ["-f", "rawvideo", "-pix_fmt", "yuvj420p",
+                    "-s", f"{ew}x{eh}", "-framerate", f"{fps:.3f}",
+                    "-i", "pipe:0",
+                    "-c:v", "mjpeg", "-q:v", str(_jpeg_qv(quality))]
+        if threads and kind != "copy_mjpeg":
+            cmd += ["-threads", str(threads)]
         cmd += [path]
 
         self._err = tempfile.TemporaryFile()
@@ -115,6 +154,8 @@ class FfmpegWriter:
     def write(self, frame: np.ndarray):
         if self.proc.poll() is not None:
             raise RuntimeError("ffmpeg завершился: " + self.error_tail())
+        if self._conv is not None:
+            frame = self._conv(frame)
         data = frame if frame.flags["C_CONTIGUOUS"] \
             else np.ascontiguousarray(frame)
         self.proc.stdin.write(memoryview(data).cast("B"))
@@ -140,8 +181,8 @@ class FfmpegWriter:
         except subprocess.TimeoutExpired:
             self.proc.kill()
             log.error("ffmpeg не закрылся за 60 с — убит: %s", self.path)
-        rc = self.proc.returncode
-        if rc not in (0, None):
+        rc = self.returncode = self.proc.returncode
+        if rc not in (0, None) and not self.quiet:
             log.error("ffmpeg завершился с кодом %s: %s", rc,
                       self.error_tail())
         try:
@@ -198,6 +239,75 @@ class _Cv2Writer:
         self._w.release()
 
 
+_selftest_cache: dict = {}
+
+
+def ffmpeg_selftest(kind: str, is_color: bool = False) -> Tuple[bool, str]:
+    """
+    Пробный запуск ffmpeg с ТЕМИ ЖЕ ключами, что и при записи (вход из
+    stdin, нужный кодек, контейнер mkv) на нескольких крошечных кадрах.
+    Нужен, потому что часть сборок ffmpeg урезана: нет `image2pipe`,
+    `rawvideo`, протокола pipe/fd и т.п. — тогда он падает при старте.
+    Результат кэшируется. Возвращает (ok, текст_ошибки).
+    """
+    key = (ffmpeg_path(), kind, bool(is_color))
+    if key in _selftest_cache:
+        return _selftest_cache[key]
+
+    ok, msg = False, ""
+    if ffmpeg_path() is None:
+        msg = "ffmpeg не найден в PATH"
+    else:
+        tmpdir = tempfile.mkdtemp(prefix="dashcam_ffcheck_")
+        path = os.path.join(tmpdir, "check.mkv")
+        w = None
+        try:
+            w, h = 64, 48
+            w_ = FfmpegWriter(path, 30.0, (w, h), is_color, kind,
+                              quiet=True)
+            w = w_
+            if kind == "copy_mjpeg":
+                img = np.full((h, 64, 3), 127, np.uint8)
+                frame = cv2.imencode(".jpg", img)[1].reshape(1, -1)
+            else:
+                shape = (h, 64, 3) if is_color else (h, 64)
+                frame = np.full(shape, 127, np.uint8)
+            for _ in range(3):
+                w_.write(frame)
+            w_.release()
+            w = None
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            if w_.returncode == 0 and size > 0:
+                ok = True
+            else:
+                msg = w_.error_tail() or f"код возврата {w_.returncode}"
+        except Exception as e:
+            msg = (w.error_tail() if w is not None else "") or str(e)
+        finally:
+            if w is not None:
+                try:
+                    w.release()
+                except Exception:
+                    pass
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    _selftest_cache[key] = (ok, msg)
+    if ok:
+        log.info("ffmpeg (%s) проверен: режим %s работает", ffmpeg_path(),
+                 kind)
+    else:
+        log.warning(
+            "ffmpeg (%s) НЕ работает в режиме %s: %s\n"
+            "  Скорее всего это урезанная сборка. Проверьте:\n"
+            "    which -a ffmpeg; ffmpeg -version | head -2\n"
+            "    ffmpeg -formats | grep -E 'image2pipe|rawvideo'\n"
+            "    ffmpeg -protocols | grep -E 'pipe|fd'\n"
+            "  Обычно помогает: sudo apt install --reinstall ffmpeg\n"
+            "  или укажите другой бинарник: DASHCAM_FFMPEG_PATH=/путь/к/ffmpeg",
+            ffmpeg_path(), kind, msg.replace("\n", " | ")[:300])
+    return ok, msg
+
+
 def open_writer(path: str, fps: float, size: Tuple[int, int],
                 is_color: bool, source: str, codec: str,
                 quality: int, container: str, reencode: bool = False):
@@ -207,34 +317,39 @@ def open_writer(path: str, fps: float, size: Tuple[int, int],
               закодировать заново выбранным codec
     codec:  'mjpeg' | 'ffv1'        (для source='raw')
     Возвращает (writer, описание). Бросает RuntimeError при неудаче.
+    ffmpeg используется, только если пробный запуск прошёл успешно,
+    иначе — запасной режим через OpenCV (с понятным предупреждением).
     """
     fps = max(1.0, float(fps))
-    have_ff = ffmpeg_path() is not None
-
-    if source == "mjpeg_raw" and reencode and have_ff:
-        kind = "ffv1" if codec == "ffv1" else "mjpeg"
-        inner = FfmpegWriter(path, fps, size, True, kind, quality)
-        return (_DecodingWriter(inner),
-                ("FFV1 (lossless, из декодированного JPEG)" if kind == "ffv1"
-                 else f"MJPG q{quality} (перекодирование)"))
 
     if source == "mjpeg_raw":
-        if have_ff and not reencode:
-            return (FfmpegWriter(path, fps, size, True, "copy_mjpeg"),
-                    "MJPG (без перекодирования)")
-        log.warning("ffmpeg не найден: JPEG-кадры придётся декодировать и "
-                    "кодировать заново (sudo apt install ffmpeg)")
+        if not reencode:
+            if ffmpeg_selftest("copy_mjpeg")[0]:
+                return (FfmpegWriter(path, fps, size, True, "copy_mjpeg"),
+                        "MJPG (без перекодирования)")
+            log.warning("Запись USB «как есть» недоступна — JPEG будут "
+                        "декодироваться и сжиматься заново (нагрузка на CPU "
+                        "и потеря качества). Исправьте ffmpeg.")
+        else:
+            kind = "ffv1" if codec == "ffv1" else "mjpeg"
+            if ffmpeg_selftest(kind, True)[0]:
+                inner = FfmpegWriter(path, fps, size, True, kind, quality)
+                return (_DecodingWriter(inner),
+                        ("FFV1 (lossless, из декодированного JPEG)"
+                         if kind == "ffv1"
+                         else f"MJPG q{quality} (перекодирование)"))
         return (_Cv2Writer(path, fps, size, True, quality, container,
                            decode=True), "MJPG (cv2, перекодирование)")
 
-    if have_ff:
-        kind = "ffv1" if codec == "ffv1" else "mjpeg"
+    kind = "ffv1" if codec == "ffv1" else "mjpeg"
+    if ffmpeg_selftest(kind, is_color)[0]:
         desc = ("FFV1 (lossless)" if kind == "ffv1"
                 else f"MJPG q{quality} (ffmpeg)")
         return FfmpegWriter(path, fps, size, is_color, kind, quality), desc
 
     if codec == "ffv1":
-        log.warning("ffmpeg не найден — FFV1 недоступен, пишу MJPG через cv2")
+        log.warning("FFV1 недоступен без рабочего ffmpeg — пишу MJPG через "
+                    "OpenCV (с потерями!)")
     return (_Cv2Writer(path, fps, size, is_color, quality, container),
             f"MJPG q{quality} (cv2)")
 

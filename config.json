@@ -6,6 +6,7 @@
   "container": "mkv",
   "queue_frames": 64,
   "warmup_seconds": 1.0,
+  "ffmpeg_path": "",
   "write_timestamps": true,
   "preview_fps": 15,
   "gige_buffers": 32,
