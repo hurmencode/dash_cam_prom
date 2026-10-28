@@ -117,6 +117,11 @@ class SlotState:
         self.rendered_seq = 0
         self.last_preview_decode = 0.0
 
+        # автоэкспозиция (состояние меняет только поток захвата)
+        self.ae_request = False         # поставлен хуком начала сегмента
+        self.ae_lock_at = None          # когда зафиксировать экспозицию
+        self.ae_unsupported = False
+
         # запись
         self.rec_lock = Lock()
         self.arm_pending = False
@@ -748,6 +753,10 @@ class CameraDiscoveryApp:
         cam, slot.camera = slot.camera, None
         if cam is not None:
             try:
+                if slot.ae_lock_at is not None:     # не оставляем камеру в авто
+                    slot.ae_lock_at = None
+                    cam.set_auto_exposure(False,
+                                          self.settings.auto_exposure_gain)
                 stats = cam.get_stats()
                 if stats:
                     log.info("[%s] статистика потока: %s", slot.name, stats)
@@ -790,6 +799,8 @@ class CameraDiscoveryApp:
         slot.frames_total = 0
         slot.stalled = False
         slot.last_frame_time = time.time()
+        slot.ae_request, slot.ae_lock_at = False, None
+        slot.ae_unsupported = False
         slot.thread = Thread(
             target=self._capture_loop,
             args=(slot, slot.camera, slot.stop_evt),
@@ -824,6 +835,14 @@ class CameraDiscoveryApp:
                 continue
 
             now = time.time()
+
+            # ---- автоэкспозиция: начало окна / фиксация значения ----
+            if slot.ae_request:
+                slot.ae_request = False
+                self._ae_start(slot, cam)
+            if slot.ae_lock_at is not None and now >= slot.ae_lock_at:
+                self._ae_finish(slot, cam)
+
             if frame is None:
                 if not slot.stalled and now - slot.last_frame_time > 3.0:
                     slot.stalled = True
@@ -869,7 +888,8 @@ class CameraDiscoveryApp:
             # ---- запись ----
             rec = slot.recorder
             if rec is not None:
-                rec.submit(frame, now)
+                rec.submit(frame, now,
+                           1 if slot.ae_lock_at is not None else 0)
                 warm, warm_n, warm_t0 = [], 0, None
             elif slot.arm_pending:
                 # Меряем реальный FPS ~1 с, чтобы записать его в файл.
@@ -887,6 +907,43 @@ class CameraDiscoveryApp:
                 warm, warm_n, warm_t0 = [], 0, None
 
         log.info("[%s] поток захвата завершён", slot.name)
+
+    # ------------------------------------------------------------------
+    #  Автоэкспозиция в начале каждого сегмента
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fmt_exposure(st):
+        parts = []
+        if "exposure_us" in st:
+            parts.append(f"экспозиция {st['exposure_us']:.0f} мкс")
+        if "gain" in st:
+            parts.append(f"усиление {st['gain']:.2f}")
+        return ", ".join(parts) or "значения недоступны"
+
+    def _ae_start(self, slot, cam):
+        """Вызывается из потока захвата в начале сегмента."""
+        s = self.settings
+        secs = s.auto_exposure_seconds
+        if (secs <= 0 or slot.ae_unsupported
+                or not cam.supports_auto_exposure):
+            return          # USB и выключенная настройка — молча
+        if not cam.set_auto_exposure(True, s.auto_exposure_gain):
+            slot.ae_unsupported = True
+            log.warning("[%s] камера не поддерживает управление "
+                        "автоэкспозицией (ExposureAuto) — пропускаю",
+                        slot.name)
+            return
+        slot.ae_lock_at = time.time() + secs
+        log.info("[%s] автоэкспозиция включена на %.0f с (начало сегмента)",
+                 slot.name, secs)
+
+    def _ae_finish(self, slot, cam):
+        """Фиксирует подобранную экспозицию. Из потока захвата."""
+        slot.ae_lock_at = None
+        ok = cam.set_auto_exposure(False, self.settings.auto_exposure_gain)
+        log.info("[%s] экспозиция %s: %s", slot.name,
+                 "зафиксирована" if ok else "НЕ удалось зафиксировать",
+                 self._fmt_exposure(cam.get_exposure_state()))
 
     def _start_slot_recorder(self, slot, cam, frame, fps, warm):
         """Вызывается из потока захвата."""
@@ -915,7 +972,9 @@ class CameraDiscoveryApp:
                     on_disk_full=lambda free, sl=slot:
                         self._post(lambda: self._handle_disk_full(sl, free)),
                     on_error=lambda msg, sl=slot:
-                        self._post(lambda: self._handle_rec_error(sl, msg)))
+                        self._post(lambda: self._handle_rec_error(sl, msg)),
+                    on_segment=lambda idx, path, sl=slot:
+                        setattr(sl, "ae_request", True))
                 rec.start()
             except Exception as e:
                 log.error("[%s] не удалось начать запись: %s", slot.name, e)
@@ -1090,6 +1149,9 @@ class CameraDiscoveryApp:
                         f"записано {rec.frames_written}, "
                         f"очередь {rec.queue_size}")
                 lost = rec.frames_dropped + rec.frames_corrupt
+                if slot.ae_lock_at is not None:
+                    text += (f" | автоэкспозиция ещё "
+                             f"{max(0, int(slot.ae_lock_at - time.time()))} с")
                 if lost:
                     text += f" | ПОТЕРЯНО {lost}"
                 self._set(slot.rec_label, text=text,

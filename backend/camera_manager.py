@@ -10,6 +10,7 @@ import contextlib
 import gc
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -72,6 +73,24 @@ class CameraInterface(ABC):
         pass
 
     def get_stats(self) -> Dict:
+        return {}
+
+    # --- автоэкспозиция (только GigE/Aravis) ---
+    # Для USB (UVC) не используется: экспозиция остаётся как настроена
+    # в камере.
+    supports_auto_exposure = False
+
+    def set_auto_exposure(self, enabled: bool,
+                          with_gain: bool = False) -> bool:
+        """
+        True  — камера подбирает экспозицию сама (непрерывно).
+        False — зафиксировать ТЕКУЩЕЕ значение (ручной режим).
+        Возвращает False, если камера этого не умеет.
+        """
+        return False
+
+    def get_exposure_state(self) -> Dict:
+        """{'exposure_us': ..., 'gain': ...} — что есть возможно узнать."""
         return {}
 
 
@@ -273,6 +292,7 @@ class UsbCameraManager(CameraInterface):
 # ============ GigE / U3V через Aravis ============
 class ArvCameraManager(CameraInterface):
     """Камера через Aravis. Кадры — Mono8 (2D uint8), без cvtColor."""
+    supports_auto_exposure = True
 
     def __init__(self, arv_device_id: Optional[str] = None,
                  pixel_format: str = "Mono8",
@@ -382,6 +402,56 @@ class ArvCameraManager(CameraInterface):
             return fn()
         except Exception:
             return default
+
+    # ---- автоэкспозиция (GenICam ExposureAuto / GainAuto) ----
+    def get_exposure_state(self) -> Dict:
+        cam = self.camera
+        out = {}
+        if cam is None:
+            return out
+        v = self._safe(cam.get_exposure_time)
+        if v is not None:
+            out["exposure_us"] = float(v)
+        g = self._safe(cam.get_gain)
+        if g is not None:
+            out["gain"] = float(g)
+        return out
+
+    def set_auto_exposure(self, enabled: bool,
+                          with_gain: bool = False) -> bool:
+        cam = self.camera
+        if cam is None:
+            return False
+        try:
+            if enabled:
+                cam.set_exposure_time_auto(Aravis.Auto.CONTINUOUS)
+                if with_gain:
+                    try:
+                        cam.set_gain_auto(Aravis.Auto.CONTINUOUS)
+                    except Exception as e:
+                        log.warning("GainAuto недоступен: %s", e)
+                return True
+
+            # Фиксация: запоминаем значения, выключаем авто и убеждаемся,
+            # что камера не откатилась к старому ручному значению.
+            before = self.get_exposure_state()
+            cam.set_exposure_time_auto(Aravis.Auto.OFF)
+            if with_gain:
+                self._safe(lambda: cam.set_gain_auto(Aravis.Auto.OFF))
+            after = self.get_exposure_state()
+            e0, e1 = before.get("exposure_us"), after.get("exposure_us")
+            if e0 and e1 is not None and abs(e1 - e0) / e0 > 0.05:
+                cam.set_exposure_time(e0)
+                log.info("Экспозиция возвращена к подобранной: %.0f мкс "
+                         "(камера откатилась к %.0f)", e0, e1)
+            g0, g1 = before.get("gain"), after.get("gain")
+            if with_gain and g0 is not None and g1 is not None \
+                    and abs(g1 - g0) > 0.1:
+                cam.set_gain(g0)
+            return True
+        except Exception as e:
+            log.warning("Автоэкспозиция недоступна у этой камеры: %s", e)
+            return False
 
     def get_frame(self, timeout_ms: int = 200) -> Optional[np.ndarray]:
         stream = self.stream

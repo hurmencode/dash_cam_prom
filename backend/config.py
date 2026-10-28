@@ -37,6 +37,12 @@ class Settings:
     ffmpeg_path: str = ""             # путь к ffmpeg, если не из PATH
     write_timestamps: bool = True     # CSV с номером и временем каждого кадра
 
+    # Автоэкспозиция в начале КАЖДОГО сегмента: камера подбирает экспозицию
+    # указанное число секунд, затем значение фиксируется (для датасета важна
+    # постоянная экспозиция внутри сегмента). 0 — выключено.
+    auto_exposure_seconds: float = 30.0
+    auto_exposure_gain: bool = False  # заодно подбирать усиление (GainAuto)
+
     # --- превью ---
     preview_fps: int = 15             # ограничение частоты обновления превью
 
@@ -113,6 +119,7 @@ def load_settings() -> Settings:
     s.segment_seconds = max(60, s.segment_seconds)
     s.queue_frames = max(8, s.queue_frames)
     s.preview_fps = max(1, s.preview_fps)
+    s.auto_exposure_seconds = max(0.0, float(s.auto_exposure_seconds))
     s.encoder = s.encoder.lower() if s.encoder.lower() in (
         "auto", "mjpg", "ffv1") else "auto"
     s.container = s.container.lower() if s.container.lower() in (

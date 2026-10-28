@@ -366,7 +366,8 @@ class SegmentedRecorder:
                  queue_frames: int = 64, write_csv: bool = True,
                  reencode: bool = False,
                  on_disk_full: Optional[Callable[[float], None]] = None,
-                 on_error: Optional[Callable[[str], None]] = None):
+                 on_error: Optional[Callable[[str], None]] = None,
+                 on_segment: Optional[Callable[[int, str], None]] = None):
         self.output_dir = output_dir
         self.camera_name = safe_filename(camera_name)
         self.width = int(width)
@@ -383,6 +384,7 @@ class SegmentedRecorder:
         self.reencode = reencode
         self.on_disk_full = on_disk_full
         self.on_error = on_error
+        self.on_segment = on_segment   # (индекс, путь); из потока записи
 
         self._q: "queue.Queue" = queue.Queue(
             maxsize=max(8, int(queue_frames)))
@@ -420,12 +422,14 @@ class SegmentedRecorder:
         self._thread.start()
         return True
 
-    def submit(self, frame: np.ndarray, ts: Optional[float] = None) -> bool:
+    def submit(self, frame: np.ndarray, ts: Optional[float] = None,
+               flag: int = 0) -> bool:
         """
         Неблокирующая постановка кадра. ts — время прихода (unix).
         Каждому предложенному кадру присваивается номер camera_seq; если
         кадр отброшен (очередь полна / битый JPEG), в CSV будет разрыв
-        в нумерации.
+        в нумерации. flag (0/1) попадает в колонку ae_active CSV: 1 — кадр
+        снят в окне автоэкспозиции (экспозиция ещё менялась).
         """
         seq = self._offered
         self._offered += 1
@@ -440,7 +444,8 @@ class SegmentedRecorder:
             return False
         try:
             self._q.put_nowait(
-                (frame, ts if ts is not None else time.time(), seq))
+                (frame, ts if ts is not None else time.time(), seq,
+                 1 if flag else 0))
             return True
         except queue.Full:
             self.frames_dropped += 1
@@ -492,13 +497,18 @@ class SegmentedRecorder:
             try:
                 self._csv = open(os.path.splitext(path)[0] + ".csv", "w",
                                  buffering=1)
-                self._csv.write("frame_index,camera_seq,unix_time\n")
+                self._csv.write("frame_index,camera_seq,unix_time,ae_active\n")
             except Exception as e:
                 log.warning("CSV с метками времени не создан: %s", e)
                 self._csv = None
         log.info("[%s] сегмент %d открыт: %s, %dx%d, %.2f fps -> %s",
                  self.camera_name, self.segment_index, desc,
                  self.width, self.height, self.fps, path)
+        if self.on_segment:
+            try:
+                self.on_segment(self.segment_index, path)
+            except Exception:
+                log.exception("on_segment")
 
     def _close_segment(self):
         w, self._writer = self._writer, None
@@ -538,7 +548,7 @@ class SegmentedRecorder:
         try:
             while True:
                 try:
-                    frame, ts, seq = self._q.get(timeout=0.25)
+                    frame, ts, seq, flag = self._q.get(timeout=0.25)
                 except queue.Empty:
                     if self._stop.is_set():
                         break
@@ -572,7 +582,7 @@ class SegmentedRecorder:
                     self._writer.write(frame)
                     if self._csv is not None:
                         self._csv.write(
-                            f"{self._segment_frame},{seq},{ts:.6f}\n")
+                            f"{self._segment_frame},{seq},{ts:.6f},{flag}\n")
                     self._segment_frame += 1
                     self.frames_written += 1
                     write_errors = 0
